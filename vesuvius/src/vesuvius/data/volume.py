@@ -1193,7 +1193,8 @@ class Volume:
                     data_slice = cast
                     if self.verbose: print(f"  Cast existing float ({original_dtype}) to {np.dtype(work_dtype).name} for normalization.")
             elif (np.issubdtype(data_slice.dtype, np.integer)
-                    and self.normalization_scheme == 'instance_minmax' and int_target is None
+                    and self.normalization_scheme in ('instance_minmax', 'percentile_minmax')
+                    and int_target is None
                     and np.can_cast(data_slice.dtype, work_dtype, casting='safe')):
                 # Every value is exact in the work float, so x - min is exact there too:
                 # a plain cast gives the same bytes as the shift below, without the
@@ -1293,6 +1294,12 @@ class Volume:
                         # first so neither the range nor x - min overflows to inf.
                         half = data_slice.dtype.type(0.5)
                         res = (x * half - min_val * half) / (max_val * half - min_val * half)
+                    elif fin is None and x.flags.writeable:
+                        # Same arithmetic as below, in place (no temporary of the instance size).
+                        denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
+                        np.subtract(x, min_val, out=x)
+                        np.divide(x, denominator, out=x)
+                        continue
                     else:
                         denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
                         res = (x - min_val) / denominator
@@ -1374,8 +1381,8 @@ class Volume:
                         # Scale to target range, clip just in case due to float precision
                         # data_slice is float64 for >=32-bit targets (see step 1); float32
                         # holds the 8/16-bit maxima exactly, so scale in the working dtype.
-                        data_slice = _float_to_int_saturate(
-                            data_slice * data_slice.dtype.type(max_target_val), target_dtype, inplace=True)
+                        scaled = data_slice * data_slice.dtype.type(max_target_val)
+                        data_slice = _float_to_int_saturate(scaled, target_dtype, inplace=True)
                         final_dtype = target_dtype
                         if self.verbose: print(f"  Scaled [0,1] data to target integer {target_dtype_str}.")
                     elif self.normalization_scheme in ['instance_zscore', 'global_zscore']:
