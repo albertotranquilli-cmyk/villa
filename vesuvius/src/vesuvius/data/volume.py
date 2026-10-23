@@ -1054,7 +1054,7 @@ class Volume:
                     if self.normalization_scheme in ['instance_minmax', 'percentile_minmax']:  # Data is in [0, 1] range
                         max_target_val = get_max_value(target_dtype)
                         # Scale to target range, clip just in case due to float precision
-                        data_slice = np.clip(data_slice * max_target_val, 0, max_target_val)
+                        data_slice = np.clip(np.rint(data_slice * max_target_val), 0, max_target_val)
                         final_dtype = target_dtype
                         if self.verbose: print(f"  Scaled [0,1] data to target integer {target_dtype_str}.")
                     elif self.normalization_scheme in ['instance_zscore', 'global_zscore']:
@@ -1064,7 +1064,20 @@ class Volume:
                               f"Output remains {final_dtype} to avoid data loss. Adjust 'return_as_type' or normalization scheme if needed.")
                         # final_dtype remains float32
                     else:  # Normalization was 'none'
-                        # Allow direct casting if no normalization occurred
+                        # A plain astype wraps out-of-range integers (uint16 65535 -> uint8 255,
+                        # 256 -> 0). Narrowing unsigned -> unsigned rescales by the dtype ranges
+                        # (uint16 -> uint8 is v >> 8); anything else is clipped to the target range.
+                        src_dtype = data_slice.dtype
+                        tinfo = np.iinfo(target_dtype)
+                        if (np.issubdtype(src_dtype, np.unsignedinteger)
+                                and np.issubdtype(target_dtype, np.unsignedinteger)
+                                and np.iinfo(src_dtype).max > tinfo.max):
+                            shift = np.iinfo(src_dtype).bits - tinfo.bits
+                            data_slice = data_slice >> shift
+                        elif np.issubdtype(src_dtype, np.floating):
+                            data_slice = np.clip(np.rint(data_slice), tinfo.min, tinfo.max)
+                        elif np.issubdtype(src_dtype, np.integer) and not np.can_cast(src_dtype, target_dtype):
+                            data_slice = np.clip(data_slice, tinfo.min, tinfo.max)
                         final_dtype = target_dtype
                         if self.verbose: print(f"  Casting non-normalized data to target integer {target_dtype_str}.")
 
