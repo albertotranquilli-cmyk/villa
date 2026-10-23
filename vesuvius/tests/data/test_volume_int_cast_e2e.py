@@ -597,6 +597,24 @@ def test_overflow_path_with_list_mean(tmp_path, fmt):
     np.testing.assert_array_equal(out, [2.0, 1.0 / 1e308, 2.0 / 1e308])
 
 
+# A per-channel mean as a list/tuple/(C,) array broadcasts along X, not C. When X != C
+# the plain formula changes the shape; on the overflow path that must not come back
+# silently as a (C, Z, Y, C) array: either the input shape or a clear ValueError.
+@pytest.mark.parametrize("form", ["list", "tuple", "np(C,)", "list_np"])
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_overflow_path_keeps_input_shape_for_vector_mean(tmp_path, fmt, form):
+    data = np.array([[1e308, -1e308], [-1e308, 1e308]], np.float64).reshape(2, 2, 1, 1)
+    m = [-1e308, -5e307]
+    mean = {"list": m, "tuple": tuple(m), "np(C,)": np.array(m), "list_np": [np.float64(x) for x in m]}[form]
+    try:
+        out = _read_4d(tmp_path, data, fmt, normalization_scheme="global_zscore",
+                       return_as_type="np.float64", global_mean=mean, global_std=1e308)
+    except ValueError as e:
+        assert "shape" in str(e)
+    else:
+        assert out.shape == data.shape
+
+
 # int64 with one outlier at -2**63: after the exact min shift, 0..998 sit near 2**63, where
 # float64 cannot tell them apart, so p1 == p99 and the whole instance came back 0.
 @pytest.mark.parametrize("src", ["int64", "uint64"])

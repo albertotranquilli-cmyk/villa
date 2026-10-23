@@ -132,7 +132,7 @@ def _float_to_int_saturate(arr, target_dtype, inplace=False):
     out[lo] = tinfo.min
     return out
 
-def _subtract_instance_min_exact(arr, work_dtype, percentile=False):
+def _subtract_instance_min_exact(arr, work_dtype, percentile=False, pct_cache=None, span_cache=None):
     """Return ``arr - min`` per normalization instance, computed exactly, as ``work_dtype``.
 
     A read with more than 3 dims is shifted per channel (axis 0); any other read
@@ -143,6 +143,10 @@ def _subtract_instance_min_exact(arr, work_dtype, percentile=False):
     modular uint64 subtraction of the two's-complement bit patterns gives it
     exactly, for signed and unsigned inputs alike.
 
+    Float work dtype, every value and the span exact in it (the common case): a
+    plain cast, minus the minimum for ``percentile=True``; instance_minmax subtracts
+    the minimum itself, so its output is not shifted there (same bytes either way).
+
     ``percentile=True`` (percentile_minmax): if the span max - min is not exact in
     ``work_dtype`` and the shifted values leave too few representable steps between the
     percentiles (int64 [-2**63, 0..999] -> 0..999 near 2**63 in float64, so p1 == p99),
@@ -151,24 +155,55 @@ def _subtract_instance_min_exact(arr, work_dtype, percentile=False):
     order statistics, and hence the percentiles, are those of the exact values,
     and everything outside [p1, p99] is clipped afterwards anyway. Spans that are
     exact keep the min shift, so ordinary data is unchanged.
+
+    ``span_cache``: a list that receives each group's span (max - min).
+
+    ``pct_cache``: a list that receives, per group, the (p1, p99) of the returned
+    values when this function computed them, else None, so percentile_minmax need
+    not compute them again.
     """
     arr = np.asarray(arr)
-    as_u64 = (arr.astype(np.int64, copy=False).view(np.uint64)
-              if np.issubdtype(arr.dtype, np.signedinteger) else arr.astype(np.uint64, copy=False))
+    signed = np.issubdtype(arr.dtype, np.signedinteger)
+    as_u64 = None
     out = np.empty(arr.shape, dtype=work_dtype)
     groups = [(i,) for i in range(arr.shape[0])] if arr.ndim > 3 else [(Ellipsis,)]
+    exact_lim = (2 ** (np.finfo(work_dtype).nmant + 1)
+                 if np.issubdtype(work_dtype, np.floating) else 0)
     for g in groups:
-        mn = np.min(arr[g])
-        mn_u64 = (np.array(mn, dtype=np.int64).view(np.uint64)
-                  if np.issubdtype(arr.dtype, np.signedinteger) else np.uint64(mn))
-        if not percentile:
-            out[g] = (as_u64[g] - mn_u64).astype(work_dtype)
+        a = arr[g]
+        mn = np.min(a)
+        mx = np.max(a)
+        span = int(mx) - int(mn)
+        if span_cache is not None:
+            span_cache.append(span)
+        if span <= exact_lim and max(abs(int(mn)), abs(int(mx))) <= exact_lim:
+            # Common case: every value, the minimum and every difference are exact in
+            # work_dtype, so subtracting there gives the same bytes. instance_minmax
+            # subtracts the minimum itself, exactly, so a plain cast is enough there.
+            o = out[g]
+            o[...] = a
+            if percentile:
+                np.subtract(o, o.dtype.type(mn), out=o)
+            if pct_cache is not None:
+                pct_cache.append(None)
             continue
-        d = as_u64[g] - mn_u64
-        out[g] = d.astype(work_dtype)
-        span = int(np.max(d))
-        del d
-        if span <= 2 ** (np.finfo(work_dtype).nmant + 1):
+        if span < 2 ** 63:
+            # Fast path: x - min is exact, then one cast rounds it to work_dtype: the
+            # same value as the uint64 route below, without the uint64 round trip.
+            # One pass, no temporary: subtract in int64 (exact for <= 32-bit inputs;
+            # for 64-bit inputs the wrap-around result is exact since span < 2**63) or
+            # uint64 (modular), and cast each result to work_dtype on the way out.
+            np.subtract(a, mn, out=out[g], dtype=np.uint64 if arr.dtype == np.uint64 else np.int64,
+                        casting='unsafe')
+        else:
+            if as_u64 is None:
+                as_u64 = (arr.astype(np.int64, copy=False).view(np.uint64)
+                          if signed else arr.astype(np.uint64, copy=False))
+            mn_u64 = np.array(mn, dtype=np.int64).view(np.uint64) if signed else np.uint64(mn)
+            out[g] = (as_u64[g] - mn_u64).astype(work_dtype)
+        if not percentile or span <= 2 ** (np.finfo(work_dtype).nmant + 1):
+            if pct_cache is not None:
+                pct_cache.append(None)
             continue
         # The span is not exact in work_dtype. Re-shift only if the min shift really
         # degrades the [p1, p99] window: fewer than ~1024 representable steps between
@@ -176,12 +211,18 @@ def _subtract_instance_min_exact(arr, work_dtype, percentile=False):
         # min shift (same bytes).
         lo, hi = np.percentile(out[g], (1.0, 99.0))
         if (hi - lo) >= 1024 * np.spacing(np.asarray(max(abs(lo), abs(hi)), dtype=work_dtype)):
+            if pct_cache is not None:
+                pct_cache.append((lo, hi))
             continue
+        if pct_cache is not None:
+            pct_cache.append(None)
         flat = np.asarray(arr[g]).ravel()
         k = max(int(np.floor((flat.size - 1) * 0.01)) - 1, 0)
         ref = np.partition(flat, k)[k]
-        ref_u64 = (np.array(ref, dtype=np.int64).view(np.uint64)
-                   if np.issubdtype(arr.dtype, np.signedinteger) else np.uint64(ref))
+        if as_u64 is None:
+            as_u64 = (arr.astype(np.int64, copy=False).view(np.uint64)
+                      if signed else arr.astype(np.uint64, copy=False))
+        ref_u64 = np.array(ref, dtype=np.int64).view(np.uint64) if signed else np.uint64(ref)
         o = (as_u64[g] - ref_u64).astype(work_dtype)
         o[np.asarray(arr[g]) < ref] = -1
         out[g] = o
@@ -198,7 +239,7 @@ def _exact_round_ratio(d, span, T):
     return np.array(q.ravel().tolist(), dtype=np.uint64).reshape(d.shape)
 
 
-def _minmax_to_int_exact(x, target_dtype):
+def _minmax_to_int_exact(x, target_dtype, span=None):
     """Exact ``round_half_even((x - min) * T / (max - min))`` for integer ``x``.
 
     ``T`` is the target max. A constant instance maps to 0, like the float path.
@@ -213,8 +254,11 @@ def _minmax_to_int_exact(x, target_dtype):
     T = int(np.iinfo(target_dtype).max)
     if x.size == 0:
         return np.zeros(x.shape, dtype=target_dtype)
-    mn, mx = int(x.min()), int(x.max())
-    span = mx - mn
+    if span is not None and x.dtype == np.uint64:
+        mn = 0  # shifted by _subtract_instance_min_exact, which also gave the span
+    else:
+        mn, mx = int(x.min()), int(x.max())
+        span = mx - mn
     if span == 0:
         return np.zeros(x.shape, dtype=target_dtype)
     if x.dtype.itemsize <= 2:
@@ -224,18 +268,46 @@ def _minmax_to_int_exact(x, target_dtype):
         lut = np.zeros(1 << (8 * x.dtype.itemsize), dtype=target_dtype)
         lut[np.arange(mn, mx + 1).astype(x.dtype).view(u)] = lut_vals
         return lut[x.view(u)]
-    d = x.astype(np.uint64, copy=False) - np.uint64(mn)
+    if x.dtype.itemsize <= 4 and span * T < 2 ** 51:
+        # x - min is exact in float64; then as below without the tie check.
+        y = x.astype(np.float64)
+        y -= float(mn)
+        y *= float(T)
+        y /= float(span)
+        np.rint(y, out=y)
+        return y.astype(target_dtype)
+    if mn == 0 and x.dtype == np.uint64:
+        d = x  # already shifted by _subtract_instance_min_exact
+    elif x.dtype.itemsize <= 4:
+        d = (x.astype(np.int64) - np.int64(mn)).view(np.uint64)  # exact, >= 0
+    else:
+        d = x.astype(np.uint64, copy=False) - np.uint64(mn)
     if np.iinfo(target_dtype).bits >= 64:
         return _exact_round_ratio(d, span, T).astype(target_dtype)
-    y = d.astype(np.float64) * (float(T) / float(span))
+    # span < 2**63: d is non-negative as int64, and the signed cast is much faster.
+    y = (d.view(np.int64) if span < 2 ** 63 else d).astype(np.float64)
+    if span * T < 2 ** 51:
+        # d * T is exact in float64 and the division is correctly rounded. A true
+        # quotient is either an exact .5 tie (then y is exactly that tie) or at least
+        # 1 / (2 * span) > ulp(y) from one, so y lies on the same side: np.rint's
+        # half-even rounding of y is then the exact result, no tie check needed.
+        y *= float(T)
+        y /= float(span)
+        np.rint(y, out=y)
+        return y.astype(target_dtype)
+    y *= float(T) / float(span)
     # |error| <= ~4 ulp(y): rounding of d, of T/span, of the product, of T and span.
     tol = 16 * np.finfo(np.float64).eps * max(float(T), 1.0)
     q = np.rint(y)
-    amb = np.abs(np.abs(y - np.floor(y)) - 0.5) <= tol
-    out = q.astype(np.uint64)
+    # |y - rint(y)| equals |y - floor(y)| reflected about 0.5, so this is the
+    # distance from a .5 tie; both subtractions are exact.
+    np.subtract(y, q, out=y)
+    np.abs(y, out=y)  # <= 0.5, so its distance from a tie is 0.5 - y
+    amb = y >= 0.5 - tol
+    out = q.astype(target_dtype)
     if amb.any():
-        out[amb] = _exact_round_ratio(d[amb], span, T)
-    return out.astype(target_dtype)
+        out[amb] = _exact_round_ratio(d[amb], span, T).astype(target_dtype)
+    return out
 
 
 def _nonfinite_mask(x):
@@ -300,6 +372,14 @@ def _widen_if_overflow(res, src, fn, stable):
     """
     if np.isfinite(res).all():
         return res
+    if res.shape != np.shape(src):
+        # mean/std broadcast against src to a different shape (e.g. a list mean of
+        # length C against a CZYX read with X != C). The plain formula already gives
+        # that shape; the voxel-wise fix below cannot, so say so instead of guessing.
+        raise ValueError(
+            f"global_zscore/ct: mean/std broadcast the input of shape {np.shape(src)} to "
+            f"{res.shape}, and the overflow fix needs them to keep the input shape; "
+            f"give per-channel statistics with shape (C, 1, 1, 1)")
     if (res.dtype == np.float32
             and np.count_nonzero(np.isfinite(res)) < np.count_nonzero(np.isfinite(src))):
         src = src.astype(np.float64)
@@ -1227,6 +1307,8 @@ class Volume:
         work_dtype = np.float32
         int_target = self._integer_return_dtype()
         exact_int_minmax = False
+        pct_cache = None
+        span_cache = None
         if (self.normalization_scheme in ('instance_minmax', 'percentile_minmax')
                 and int_target is not None
                 and (np.iinfo(int_target).bits >= 32
@@ -1264,10 +1346,13 @@ class Volume:
                 # instance_minmax to an integer type is finished exactly in integer
                 # arithmetic below (float64 scaling of 64-bit spans misrounds by 1:
                 # int64 -1 in [-2**63, 2**63-1] -> uint8 128 instead of 127).
-                if not (exact_int_minmax and data_slice.dtype.itemsize <= 2):  # 8/16-bit: LUT on raw values
+                if not (exact_int_minmax and data_slice.dtype.itemsize <= 4):  # <= 32-bit: exact on raw values
+                    pct_cache = []
+                    span_cache = []
                     data_slice = _subtract_instance_min_exact(
                         data_slice, np.uint64 if exact_int_minmax else work_dtype,
-                        percentile=self.normalization_scheme == 'percentile_minmax')
+                        percentile=self.normalization_scheme == 'percentile_minmax',
+                        pct_cache=pct_cache, span_cache=span_cache)
                 if self.verbose: print(f"  Shifted {original_dtype} by its instance minimum and cast to {np.dtype(work_dtype).name}.")
             else:
                 # If integer or other, convert to float32
@@ -1332,7 +1417,9 @@ class Volume:
         elif self.normalization_scheme == 'instance_minmax' and exact_int_minmax:
             out = np.empty(data_slice.shape, dtype=int_target)
             for c in range(data_slice.shape[0]):
-                out[c] = _minmax_to_int_exact(data_slice[c], int_target)
+                known = (span_cache[c] if span_cache is not None
+                         and len(span_cache) == data_slice.shape[0] else None)
+                out[c] = _minmax_to_int_exact(data_slice[c], int_target, span=known)
             data_slice = out
             if self.verbose: print(f"  Applied exact integer instance Min-Max scaling to {int_target.name}.")
 
@@ -1379,6 +1466,11 @@ class Volume:
                     x_orig = np.array(data_slice[c], copy=True)
                     lower, upper = _stable_percentiles(x_orig[fin])
                     data_slice[c] = np.nan_to_num(x_orig, nan=lower, posinf=upper, neginf=lower)
+                elif (pct_cache is not None and len(pct_cache) == data_slice.shape[0]
+                        and pct_cache[c] is not None):
+                    # Integer source: (p1, p99) already taken on these exact values (all
+                    # finite and >= 0, so _stable_percentiles would give the same).
+                    lower, upper = pct_cache[c]
                 else:
                     lower, upper = _stable_percentiles(data_slice[c])
                 with np.errstate(over='ignore'):
