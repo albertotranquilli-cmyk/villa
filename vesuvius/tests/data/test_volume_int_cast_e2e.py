@@ -615,6 +615,29 @@ def test_overflow_path_keeps_input_shape_for_vector_mean(tmp_path, fmt, form):
         assert out.shape == data.shape
 
 
+# REDTEAM-025: global_zscore must keep NumPy's promotion of the std, as on main: a
+# float32 source with a float64 (or 0-d float64 array) std gives float64, and
+# 1e-20 / 1e30 stays ~1e-50 instead of underflowing to 0 in float32.
+@pytest.mark.parametrize("std", [np.float64(1e30), np.array(1e30, dtype=np.float64)], ids=["f64", "0d"])
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_global_zscore_preserves_numpy_scalar_promotion(tmp_path, fmt, std):
+    x = np.array([[[1e-20, 1.0]]], np.float32)
+    expected = (x - 0.0) / max(std, 1e-8)
+    assert expected.dtype == np.float64
+    path = str(tmp_path / f"p{fmt}.zarr")
+    if _ZARR_MAJOR >= 3:
+        a = zarr.open_group(path, mode="w", zarr_format=fmt).create_array(
+            name="0", shape=x.shape, chunks=x.shape, dtype=x.dtype)
+    else:
+        a = zarr.open_group(path, mode="w").zeros(name="0", shape=x.shape, chunks=x.shape, dtype=x.dtype)
+    a[...] = x
+    v = Volume(type="zarr", path=path, verbose=False, normalization_scheme="global_zscore",
+               return_as_type="none", global_mean=0.0, global_std=std)
+    actual = np.asarray(v[0:1, 0:1, 0:2])
+    assert actual.dtype == expected.dtype
+    np.testing.assert_array_equal(actual, expected)
+
+
 # int64 with one outlier at -2**63: after the exact min shift, 0..998 sit near 2**63, where
 # float64 cannot tell them apart, so p1 == p99 and the whole instance came back 0.
 @pytest.mark.parametrize("src", ["int64", "uint64"])

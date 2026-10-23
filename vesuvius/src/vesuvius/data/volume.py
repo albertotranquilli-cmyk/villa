@@ -239,6 +239,25 @@ def _exact_round_ratio(d, span, T):
     return np.array(q.ravel().tolist(), dtype=np.uint64).reshape(d.shape)
 
 
+def _blocked_scale(x, mn, T, span, target_dtype, B=1 << 16):
+    """rint(((x - mn) * T) / span) in float64, in cache-sized blocks (same bytes as
+    the full-array expression, without full-size float64 temporaries)."""
+    flat = np.ascontiguousarray(x).reshape(-1)
+    out = np.empty(flat.size, dtype=target_dtype)
+    y = np.empty(min(B, flat.size))
+    for i in range(0, flat.size, B):
+        n = min(B, flat.size - i)
+        yy = y[:n]
+        yy[...] = flat[i:i + n]
+        if mn:
+            yy -= float(mn)
+        yy *= float(T)
+        yy /= float(span)
+        np.rint(yy, out=yy)
+        out[i:i + n] = yy
+    return out.reshape(np.shape(x))
+
+
 def _minmax_to_int_exact(x, target_dtype, span=None):
     """Exact ``round_half_even((x - min) * T / (max - min))`` for integer ``x``.
 
@@ -270,12 +289,7 @@ def _minmax_to_int_exact(x, target_dtype, span=None):
         return lut[x.view(u)]
     if x.dtype.itemsize <= 4 and span * T < 2 ** 51:
         # x - min is exact in float64; then as below without the tie check.
-        y = x.astype(np.float64)
-        y -= float(mn)
-        y *= float(T)
-        y /= float(span)
-        np.rint(y, out=y)
-        return y.astype(target_dtype)
+        return _blocked_scale(x, mn, T, span, target_dtype)
     if mn == 0 and x.dtype == np.uint64:
         d = x  # already shifted by _subtract_instance_min_exact
     elif x.dtype.itemsize <= 4:
@@ -285,29 +299,40 @@ def _minmax_to_int_exact(x, target_dtype, span=None):
     if np.iinfo(target_dtype).bits >= 64:
         return _exact_round_ratio(d, span, T).astype(target_dtype)
     # span < 2**63: d is non-negative as int64, and the signed cast is much faster.
-    y = (d.view(np.int64) if span < 2 ** 63 else d).astype(np.float64)
+    src = (d.view(np.int64) if span < 2 ** 63 else d)
     if span * T < 2 ** 51:
         # d * T is exact in float64 and the division is correctly rounded. A true
         # quotient is either an exact .5 tie (then y is exactly that tie) or at least
         # 1 / (2 * span) > ulp(y) from one, so y lies on the same side: np.rint's
         # half-even rounding of y is then the exact result, no tie check needed.
-        y *= float(T)
-        y /= float(span)
-        np.rint(y, out=y)
-        return y.astype(target_dtype)
-    y *= float(T) / float(span)
-    # |error| <= ~4 ulp(y): rounding of d, of T/span, of the product, of T and span.
+        return _blocked_scale(src, 0, T, span, target_dtype)
+    # Float64 estimate, |error| <= ~4 ulp(y) (rounding of d, of T/span, of the
+    # product, of T and span); elements within that bound of a .5 tie are recomputed
+    # exactly. Done in cache-sized blocks with two reused buffers: the same ufuncs
+    # element by element, so the same bytes, without full-size temporaries.
     tol = 16 * np.finfo(np.float64).eps * max(float(T), 1.0)
-    q = np.rint(y)
-    # |y - rint(y)| equals |y - floor(y)| reflected about 0.5, so this is the
-    # distance from a .5 tie; both subtractions are exact.
-    np.subtract(y, q, out=y)
-    np.abs(y, out=y)  # <= 0.5, so its distance from a tie is 0.5 - y
-    amb = y >= 0.5 - tol
-    out = q.astype(target_dtype)
+    ratio = float(T) / float(span)
+    flat = np.ascontiguousarray(src).reshape(-1)
+    out = np.empty(flat.size, dtype=target_dtype)
+    amb = np.empty(flat.size, dtype=bool)
+    B = 1 << 16
+    y = np.empty(min(B, flat.size))
+    q = np.empty_like(y)
+    for i in range(0, flat.size, B):
+        n = min(B, flat.size - i)
+        yy, qq = y[:n], q[:n]
+        yy[...] = flat[i:i + n]
+        yy *= ratio
+        np.rint(yy, out=qq)
+        # |y - rint(y)| <= 0.5, so its distance from a tie is 0.5 - |y - rint(y)|.
+        np.subtract(yy, qq, out=yy)
+        np.abs(yy, out=yy)
+        np.greater_equal(yy, 0.5 - tol, out=amb[i:i + n])
+        out[i:i + n] = qq
     if amb.any():
-        out[amb] = _exact_round_ratio(d[amb], span, T).astype(target_dtype)
-    return out
+        dflat = np.ascontiguousarray(d).reshape(-1)
+        out[amb] = _exact_round_ratio(dflat[amb], span, T).astype(target_dtype)
+    return out.reshape(d.shape)
 
 
 def _nonfinite_mask(x):
@@ -1407,6 +1432,8 @@ class Volume:
             def gz(a):
                 # Same arithmetic as (a - mean) / gs, in place on the subtraction temporary.
                 t = np.subtract(a, self.global_mean)
+                if np.result_type(t, gs) != t.dtype:
+                    return t / gs  # gs promotes (e.g. np.float64 std on float32 data), as on main
                 return np.divide(t, gs, out=t)
             gz_stable = lambda a: ((a * 0.5 - np.asarray(self.global_mean) * 0.5) / gs) * 2  # x - mean overflows; halving is exact in the normal range; applied only to overflowing voxels
             with np.errstate(over='ignore', invalid='ignore'):
