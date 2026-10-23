@@ -95,11 +95,12 @@ Image.MAX_IMAGE_PIXELS = None
 
 
 
-def _float_to_int_saturate(arr, target_dtype):
+def _float_to_int_saturate(arr, target_dtype, inplace=False):
     """Round float data to ``target_dtype`` with saturation instead of wrapping.
 
     Policy: NaN -> 0, +inf -> target max, -inf -> target min, finite values are
-    rounded half to even and clipped to the target range.
+    rounded half to even and clipped to the target range. ``inplace=True`` lets
+    the <=32-bit path reuse ``arr`` as scratch when it already has the work dtype.
     """
     tinfo = np.iinfo(target_dtype)
     arr = np.asarray(arr)
@@ -108,9 +109,12 @@ def _float_to_int_saturate(arr, target_dtype):
         # 8/16-bit bound, float64 the 32-bit ones (float32 cannot hold 2**31-1 or
         # 2**32-1, so clipping there would round the bound up and the cast wrap).
         work = np.float32 if (tinfo.bits <= 16 and arr.dtype in (np.float16, np.float32)) else np.float64
-        a = np.clip(arr.astype(work, copy=True), tinfo.min, tinfo.max)  # NaN passes through
+        a = arr if (inplace and arr.dtype == work) else arr.astype(work, copy=True)
+        np.clip(a, tinfo.min, tinfo.max, out=a)  # NaN passes through
         np.rint(a, out=a)  # integer bounds stay in range
-        np.nan_to_num(a, copy=False, nan=0.0)
+        nan = np.isnan(a)
+        if nan.any():
+            a[nan] = 0.0
         return a.astype(target_dtype)
     a = np.rint(np.asarray(arr, dtype=np.float64))
     # Saturate in the integer domain: float64 cannot represent int64/uint64 max
@@ -1142,6 +1146,11 @@ class Volume:
                 store = self._level(subvolume_idx)
 
             data_slice = self._read_with_retry(store, coord_idx)
+            # zarr returns a fresh array; a numpy-backed level returns a VIEW of the
+            # caller's array, and normalization below writes in place. Copy only then.
+            if (self.normalization_scheme != 'none' and isinstance(data_slice, np.ndarray)
+                    and not isinstance(store, zarr.Array) and np.may_share_memory(data_slice, store)):
+                data_slice = data_slice.copy()
 
             original_dtype = data_slice.dtype
 
@@ -1189,6 +1198,15 @@ class Volume:
                     data_slice = cast
                     if self.verbose: print(f"  Cast existing float ({original_dtype}) to {np.dtype(work_dtype).name} for normalization.")
             elif (np.issubdtype(data_slice.dtype, np.integer)
+                    and self.normalization_scheme in ('instance_minmax', 'percentile_minmax')
+                    and int_target is None
+                    and np.can_cast(data_slice.dtype, work_dtype, casting='safe')):
+                # Every value is exact in the work float, so x - min is exact there too:
+                # a plain cast gives the same bytes as the shift below, without the
+                # uint64 round trip.
+                data_slice = data_slice.astype(work_dtype)
+                if self.verbose: print(f"  Cast {original_dtype} to {np.dtype(work_dtype).name} for normalization.")
+            elif (np.issubdtype(data_slice.dtype, np.integer)
                     and self.normalization_scheme in ('instance_minmax', 'percentile_minmax')):
                 # Min-max is shift invariant, so subtract each instance's minimum exactly in
                 # the integer domain before going to float. Casting int64/uint64 first would
@@ -1223,10 +1241,13 @@ class Volume:
         # matching _float_to_int_saturate. An instance with no finite voxel becomes all 0
         # (one warning per read). Clean input takes the unchanged code path.
         all_nonfinite_instances = 0
+        # Integer sources cast to float are always finite: skip the isfinite scans.
+        src_float = np.issubdtype(original_dtype, np.floating)
+        nonfinite_mask = _nonfinite_mask if src_float else (lambda a: None)
         if self.normalization_scheme == 'instance_zscore':
             for c in range(data_slice.shape[0]):  # Iterate over channels (or the single pseudo-channel)
                 x = data_slice[c]
-                fin = _nonfinite_mask(x)
+                fin = nonfinite_mask(x)
                 if fin is None:
                     # Epsilon prevents division by zero or near-zero std dev
                     data_slice[c] = _zscore(x, *_zscore_stats(x))
@@ -1264,7 +1285,7 @@ class Volume:
         elif self.normalization_scheme == 'instance_minmax':
             for c in range(data_slice.shape[0]):
                 x = data_slice[c]
-                fin = _nonfinite_mask(x)
+                fin = nonfinite_mask(x)
                 if fin is not None and not fin.any():
                     data_slice[c] = 0.0
                     all_nonfinite_instances += 1
@@ -1278,6 +1299,12 @@ class Volume:
                         # first so neither the range nor x - min overflows to inf.
                         half = data_slice.dtype.type(0.5)
                         res = (x * half - min_val * half) / (max_val * half - min_val * half)
+                    elif fin is None and x.flags.writeable:
+                        # Same arithmetic as below, in place (no temporary of the instance size).
+                        denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
+                        np.subtract(x, min_val, out=x)
+                        np.divide(x, denominator, out=x)
+                        continue
                     else:
                         denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
                         res = (x - min_val) / denominator
@@ -1288,7 +1315,7 @@ class Volume:
 
         elif self.normalization_scheme == 'percentile_minmax':
             for c in range(data_slice.shape[0]):
-                fin = _nonfinite_mask(data_slice[c])
+                fin = nonfinite_mask(data_slice[c])
                 if fin is not None and not fin.any():
                     data_slice[c] = 0.0
                     all_nonfinite_instances += 1
@@ -1359,8 +1386,8 @@ class Volume:
                         # Scale to target range, clip just in case due to float precision
                         # data_slice is float64 for >=32-bit targets (see step 1); float32
                         # holds the 8/16-bit maxima exactly, so scale in the working dtype.
-                        data_slice = _float_to_int_saturate(
-                            data_slice * data_slice.dtype.type(max_target_val), target_dtype)
+                        scaled = data_slice * data_slice.dtype.type(max_target_val)
+                        data_slice = _float_to_int_saturate(scaled, target_dtype, inplace=True)
                         final_dtype = target_dtype
                         if self.verbose: print(f"  Scaled [0,1] data to target integer {target_dtype_str}.")
                     elif self.normalization_scheme in ['instance_zscore', 'global_zscore']:

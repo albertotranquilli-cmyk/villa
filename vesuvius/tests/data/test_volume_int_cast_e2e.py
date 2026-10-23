@@ -479,3 +479,38 @@ def test_instance_zscore_float32_variance_overflow(tmp_path, fmt):
     data = np.array([-1e20, 1e20], np.float32).reshape(1, 1, -1)
     out = _read(tmp_path, data, fmt, normalization_scheme="instance_zscore").ravel()
     np.testing.assert_allclose(out, [-1, 1], rtol=0, atol=1e-6)
+
+
+# Normalization writes in place; it must never write into data the caller owns.
+@pytest.mark.parametrize("scheme,rt", [
+    ("instance_minmax", "none"), ("instance_minmax", "np.uint8"), ("percentile_minmax", "np.float32"),
+    ("instance_zscore", "np.float32")])
+@pytest.mark.parametrize("src", ["float32", "uint16"])
+@pytest.mark.parametrize("backing", ["zarr", "memory_zarr", "numpy"])
+def test_read_does_not_mutate_source(tmp_path, backing, src, scheme, rt):
+    rng = np.random.default_rng(0)
+    data = (rng.standard_normal((2, 4, 8, 8)) * 100 + 300).astype(src)
+    ref = data.copy()
+    path = tmp_path / "v.zarr"
+    g = zarr.open_group(str(path), mode="w")
+    if _ZARR_MAJOR >= 3:
+        g.create_array(name="0", shape=data.shape, chunks=(1, 4, 4, 4), dtype=data.dtype)[...] = data
+    else:
+        g.zeros(name="0", shape=data.shape, chunks=(1, 4, 4, 4), dtype=data.dtype)[...] = data
+    vol = Volume(type="zarr", path=str(path), verbose=False, normalization_scheme=scheme, return_as_type=rt)
+    if backing == "memory_zarr":
+        mem = zarr.zeros(shape=data.shape, chunks=(1, 4, 4, 4), dtype=data.dtype)
+        mem[...] = data
+        vol.data = mem
+    elif backing == "numpy":
+        vol.data = [data]  # a level that is a plain ndarray
+    raw = Volume(type="zarr", path=str(path), verbose=False, normalization_scheme="none")
+    if backing == "numpy":
+        raw.data = [data]
+    keep = raw[:, :, :, :]
+    keep_copy = np.array(keep, copy=True)
+    first = np.array(vol[:, :, :, :], copy=True)
+    second = vol[:, :, :, :]
+    np.testing.assert_array_equal(second, first)
+    np.testing.assert_array_equal(keep, keep_copy)  # an earlier raw read is untouched
+    np.testing.assert_array_equal(data, ref)
