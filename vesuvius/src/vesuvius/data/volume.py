@@ -874,6 +874,16 @@ class Volume:
                 time.sleep(delay)
                 delay = min(delay * 2, 8.0)
 
+    def _integer_return_dtype(self):
+        """The integer dtype named by ``return_as_type``, or None."""
+        if self.return_as_type == 'none':
+            return None
+        try:
+            dt = np.dtype(getattr(np, self.return_as_type.replace('np.', '')))
+        except (AttributeError, TypeError):
+            return None
+        return dt if np.issubdtype(dt, np.integer) else None
+
     def __getitem__(self, idx: Union[Tuple[Union[int, slice], ...], int]) -> Union[NDArray, torch.Tensor]:
         """
         Gets a sub-volume or slice, applying specified normalization and type conversion.
@@ -990,16 +1000,26 @@ class Volume:
         # --- Preprocessing Steps ---
 
         # 1. Convert to float32 for normalization calculations (if needed)
+        # Min-max output that is rescaled to an integer return_as_type is computed in
+        # float64: float32 has a 24-bit mantissa, so it cannot hold int32/uint32 inputs
+        # exactly (uint32 2**32-2 -> 2**32, saturating to the max) and quantizes the
+        # [0, 1] value too coarsely for 32/64-bit targets (errors of up to 2**39 units).
+        # The output dtype is the integer target either way, so this is not observable
+        # other than through the corrected values.
+        work_dtype = np.float32
+        if (self.normalization_scheme in ('instance_minmax', 'percentile_minmax')
+                and self._integer_return_dtype() is not None):
+            work_dtype = np.float64
         if self.normalization_scheme != 'none':
             if np.issubdtype(data_slice.dtype, np.floating):
                 # If already float, ensure it's float32 for consistency
-                if data_slice.dtype != np.float32:
-                    data_slice = data_slice.astype(np.float32)
-                    if self.verbose: print(f"  Cast existing float ({original_dtype}) to np.float32 for normalization.")
+                if data_slice.dtype != work_dtype:
+                    data_slice = data_slice.astype(work_dtype)
+                    if self.verbose: print(f"  Cast existing float ({original_dtype}) to {np.dtype(work_dtype).name} for normalization.")
             else:
                 # If integer or other, convert to float32
-                data_slice = data_slice.astype(np.float32)
-                if self.verbose: print(f"  Cast {original_dtype} to np.float32 for normalization.")
+                data_slice = data_slice.astype(work_dtype)
+                if self.verbose: print(f"  Cast {original_dtype} to {np.dtype(work_dtype).name} for normalization.")
 
         # 2. Apply Normalization Scheme
         # Handle potential channel dimension (assume channels are dim 0 if present)
