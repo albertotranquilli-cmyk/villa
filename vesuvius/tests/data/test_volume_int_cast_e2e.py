@@ -450,3 +450,13 @@ def test_global_zscore_and_ct_no_overflow(tmp_path, fmt):
     out = _read(tmp_path / "ct", data, fmt, normalization_scheme="ct", intensity_props={
         "mean": -1e38, "std": 1.0, "percentile_00_5": -3e38, "percentile_99_5": 3e38})
     np.testing.assert_allclose(out.astype(np.float64).ravel(), [4e38, -2e38], rtol=1e-6)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_percentile_minmax_rejects_bad_percentiles(tmp_path, fmt, monkeypatch):
+    """The finite/ordered check is a real check (not an assert removed by -O)."""
+    import vesuvius.data.volume as vol
+    monkeypatch.setattr(vol.np, "percentile", lambda a, q, *args, **kw: np.array([np.inf, -np.inf]))
+    data = np.array([0.0, 1.0, 2.0], np.float32).reshape(1, 1, -1)
+    with pytest.raises(ValueError, match="not finite and ordered"):
+        _read(tmp_path, data, fmt, normalization_scheme="percentile_minmax")

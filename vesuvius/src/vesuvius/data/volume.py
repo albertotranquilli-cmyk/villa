@@ -271,7 +271,9 @@ def _stable_percentiles(values, q=(1.0, 99.0)):
         half = np.asarray(values).dtype.type(0.5)
         lo2, hi2 = np.percentile(np.asarray(values) * half, q)
         lower, upper = lo2 * 2, hi2 * 2
-    assert np.isfinite(lower) and np.isfinite(upper) and lower <= upper, (lower, upper)
+    if not (np.isfinite(lower) and np.isfinite(upper) and lower <= upper):
+        raise ValueError(f"percentile_minmax: percentiles are not finite and ordered "
+                         f"(lower={lower!r}, upper={upper!r})")
     return lower, upper
 
 
