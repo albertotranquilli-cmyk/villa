@@ -161,31 +161,30 @@ def _subtract_instance_min_exact(arr, work_dtype, percentile=False):
         mn = np.min(arr[g])
         mn_u64 = (np.array(mn, dtype=np.int64).view(np.uint64)
                   if np.issubdtype(arr.dtype, np.signedinteger) else np.uint64(mn))
-        d = as_u64[g] - mn_u64
-        if percentile:
-            exact_span = 2 ** (np.finfo(work_dtype).nmant + 1)
-            shifted = d.astype(work_dtype)
-            if int(np.max(d)) > exact_span:
-                # Only if the min shift really degrades the [p1, p99] window: fewer than
-                # ~1024 representable steps between the percentiles (0..999 near 2**63
-                # in float64 have none). Otherwise keep the min shift (same bytes).
-                lo, hi = np.percentile(shifted, (1.0, 99.0))
-                coarse = (hi - lo) < 1024 * np.spacing(np.asarray(max(abs(lo), abs(hi)), dtype=work_dtype))
-            else:
-                coarse = False
-            if coarse:
-                flat = np.asarray(arr[g]).ravel()
-                k = max(int(np.floor((flat.size - 1) * 0.01)) - 1, 0)
-                ref = np.partition(flat, k)[k]
-                ref_u64 = (np.array(ref, dtype=np.int64).view(np.uint64)
-                           if np.issubdtype(arr.dtype, np.signedinteger) else np.uint64(ref))
-                o = (as_u64[g] - ref_u64).astype(work_dtype)
-                o[np.asarray(arr[g]) < ref] = -1
-                out[g] = o
-                continue
-            out[g] = shifted
+        if not percentile:
+            out[g] = (as_u64[g] - mn_u64).astype(work_dtype)
             continue
+        d = as_u64[g] - mn_u64
         out[g] = d.astype(work_dtype)
+        span = int(np.max(d))
+        del d
+        if span <= 2 ** (np.finfo(work_dtype).nmant + 1):
+            continue
+        # The span is not exact in work_dtype. Re-shift only if the min shift really
+        # degrades the [p1, p99] window: fewer than ~1024 representable steps between
+        # the percentiles (0..999 near 2**63 in float64 have none). Otherwise keep the
+        # min shift (same bytes).
+        lo, hi = np.percentile(out[g], (1.0, 99.0))
+        if (hi - lo) >= 1024 * np.spacing(np.asarray(max(abs(lo), abs(hi)), dtype=work_dtype)):
+            continue
+        flat = np.asarray(arr[g]).ravel()
+        k = max(int(np.floor((flat.size - 1) * 0.01)) - 1, 0)
+        ref = np.partition(flat, k)[k]
+        ref_u64 = (np.array(ref, dtype=np.int64).view(np.uint64)
+                   if np.issubdtype(arr.dtype, np.signedinteger) else np.uint64(ref))
+        o = (as_u64[g] - ref_u64).astype(work_dtype)
+        o[np.asarray(arr[g]) < ref] = -1
+        out[g] = o
     return out
 
 
