@@ -250,14 +250,61 @@ def test_minmax_multichannel_is_shifted_per_channel(tmp_path, fmt):
     np.testing.assert_array_equal(out.reshape(2, 2), [[0, 255], [0, 255]])
 
 
-# Non-finite input: policy pinned as-is (one NaN/inf voxel zeroes the instance).
-# This documents current behaviour; it is not an endorsement (REDTEAM-020 FOUND #3).
+# Non-finite input, policy "finite_only" (REDTEAM-020 FOUND #3): statistics over the
+# finite voxels; NaN -> 0, +inf -> top of range, -inf -> bottom; no finite voxel -> 0 + one warning.
+_SCHEMES3 = ["instance_minmax", "percentile_minmax", "instance_zscore"]
+
+
+def _read_any(tmp_path, data, fmt, name, **kw):
+    sub = tmp_path / name
+    sub.mkdir()
+    return _read(sub, data, fmt, **kw)
+
+
 @pytest.mark.parametrize("fmt", FORMATS)
-@pytest.mark.parametrize("vals", [[0, 1, math.nan], [0, 1, math.inf], [-math.inf, 0, 1]])
-def test_minmax_nonfinite_policy_pinned(tmp_path, fmt, vals):
-    data = np.array(vals, dtype=np.float32).reshape(1, 1, -1)
+@pytest.mark.parametrize("scheme", _SCHEMES3)
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("rt", [None, "np.float32", "np.uint8", "np.uint16"])
+def test_nonfinite_voxel_does_not_poison_instance(tmp_path, fmt, scheme, bad, rt):
+    clean = np.linspace(10, 110, 64, dtype=np.float32)
+    data = clean.copy()
+    data[20] = bad
+    kw = dict(normalization_scheme=scheme)
+    if rt:
+        kw["return_as_type"] = rt
+    out = _read_any(tmp_path, data.reshape(1, 1, -1), fmt, "a", **kw)
+    keep = np.ones(64, bool)
+    keep[20] = False
+    ref = _read_any(tmp_path, clean[keep].reshape(1, 1, -1), fmt, "b", **kw)
+    np.testing.assert_array_equal(out[keep], ref)  # finite voxels: as if the bad one were absent
+    assert np.all(np.isfinite(out.astype(np.float64)))
+    if scheme == "instance_zscore":
+        want = {"nan": 0.0, "inf": ref.max(), "-inf": ref.min()}[str(bad)]
+    else:
+        top = 1.0 if rt in (None, "np.float32") else np.iinfo(rt.replace("np.", "")).max
+        want = {"nan": 0, "inf": top, "-inf": 0}[str(bad)]
+    assert out[20] == want
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("scheme", _SCHEMES3)
+@pytest.mark.parametrize("rt", [None, "np.uint8"])
+def test_all_nonfinite_instance_is_zero_with_one_warning(tmp_path, fmt, scheme, rt):
+    data = np.array([math.nan, math.inf, -math.inf, math.nan], np.float32).reshape(1, 1, -1)
+    kw = dict(normalization_scheme=scheme)
+    if rt:
+        kw["return_as_type"] = rt
+    with pytest.warns(RuntimeWarning, match="no finite") as rec:
+        out = _read(tmp_path, data, fmt, **kw)
+    assert len([w for w in rec if "no finite" in str(w.message)]) == 1
+    np.testing.assert_array_equal(out, [0, 0, 0, 0])
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_nonfinite_with_huge_finite_range(tmp_path, fmt):
+    data = np.array([-1e38, 0, 1e38, math.nan, math.inf], np.float32).reshape(1, 1, -1)
     out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type="np.uint8")
-    np.testing.assert_array_equal(out, [0, 0, 0])
+    np.testing.assert_array_equal(out, [0, 128, 255, 0, 255])
 
 
 @pytest.mark.parametrize("fmt", FORMATS)
@@ -320,3 +367,115 @@ def test_instance_minmax_exact_64bit_target_interior(tmp_path, fmt, tgt):
     out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type=f"np.{tgt}")
     top = int(np.iinfo(tgt).max)
     assert [int(v) for v in out] == [0, round(Fraction(top, 3)), top]
+
+
+# REDTEAM-022: np.percentile([-1e308, 1e308], (1, 99)) overflows to [inf, -inf], which
+# sent percentile_minmax to the all-zero branch. Real zarr2 Volume, shape (1, 1, n).
+@pytest.mark.parametrize("vals,dtype,want", [
+    ([-1e308, 1e308], np.float64, [0, 1]),
+    ([-3e38, 3e38], np.float32, [0, 1]),
+    ([-3e38, 3e38, math.inf], np.float32, [0, 1, 1]),
+    ([-1e308, 1e308, math.inf], np.float64, [0, 1, 1]),
+])
+@pytest.mark.parametrize("rt", [None, "np.float32", "np.float64"])
+def test_percentile_minmax_opposite_extremes(tmp_path, vals, dtype, want, rt):
+    kw = dict(normalization_scheme="percentile_minmax")
+    if rt:
+        kw["return_as_type"] = rt
+    data = np.array(vals, dtype).reshape(1, 1, -1)
+    out = _read(tmp_path, data, 2, **kw)
+    np.testing.assert_allclose(out.astype(np.float64), want, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("scheme", ["instance_minmax", "percentile_minmax"])
+@pytest.mark.parametrize("rt,top", [("np.uint64", 2**64 - 1), ("np.int64", 2**63 - 1),
+                                    ("np.uint8", 255)])
+def test_bool_source_to_integer_targets(tmp_path, scheme, rt, top):
+    data = np.array([True, False, True], bool).reshape(1, 1, -1)
+    out = _read(tmp_path, data, 2, normalization_scheme=scheme, return_as_type=rt)
+    assert out.dtype == np.dtype(rt.replace("np.", ""))
+    assert out.tolist() == [top, 0, top]
+
+
+# Overflow in z-score statistics and in float64 -> float32 work casts (real Volume).
+_S2 = math.sqrt(2)
+
+
+@pytest.mark.parametrize("vals,dtype,want", [
+    ([-3e38, 3e38], np.float32, [-1, 1]),
+    ([3e38, 3e38, 0], np.float32, [1 / _S2, 1 / _S2, -_S2]),
+    ([-1e308, 1e308], np.float64, [-1, 1]),
+    ([-1e200, 1e200], np.float64, [-1, 1]),
+    ([1e308, 1e308], np.float64, [0, 0]),
+    ([-3e38, 3e38, math.inf], np.float32, [-1, 1, 1]),
+])
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_instance_zscore_no_overflow(tmp_path, fmt, vals, dtype, want):
+    data = np.array(vals, dtype).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_zscore")
+    assert np.all(np.isfinite(out))
+    np.testing.assert_allclose(out.astype(np.float64).ravel(), want, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("vals,want", [
+    ([0, 1e300, 5e299], [0, 1, 0.5]),
+    ([-1e308, 1e308, 0], [0, 1, 0.5]),
+])
+@pytest.mark.parametrize("scheme", ["instance_minmax", "percentile_minmax"])
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_float64_cast_overflow_keeps_float64_work(tmp_path, fmt, vals, want, scheme):
+    data = np.array(vals, np.float64).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme=scheme)
+    want = want if scheme == "instance_minmax" else [0, 1, 0.5]
+    np.testing.assert_allclose(out.astype(np.float64).ravel(), want, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_float64_cast_underflow_keeps_float64_work(tmp_path, fmt):
+    # 1e-300 flushes to 0 in float32, merging distinct values. The work stays float64;
+    # the result is still tiny because the existing 1e-8 range/std floor applies.
+    data = np.array([1e-300, 2e-300, 3e-300], np.float64).reshape(1, 1, -1)
+    for scheme in ("instance_minmax", "instance_zscore"):
+        out = _read(tmp_path / scheme, data, fmt, normalization_scheme=scheme).ravel()
+        assert out.dtype == np.float64
+        assert out[0] < out[1] < out[2]
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_global_zscore_and_ct_no_overflow(tmp_path, fmt):
+    data = np.array([3e38, -3e38], np.float32).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="global_zscore",
+                global_mean=-1e38, global_std=1.0)
+    np.testing.assert_allclose(out.astype(np.float64).ravel(), [4e38, -2e38], rtol=1e-6)
+    out = _read(tmp_path / "ct", data, fmt, normalization_scheme="ct", intensity_props={
+        "mean": -1e38, "std": 1.0, "percentile_00_5": -3e38, "percentile_99_5": 3e38})
+    np.testing.assert_allclose(out.astype(np.float64).ravel(), [4e38, -2e38], rtol=1e-6)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_percentile_minmax_rejects_bad_percentiles(tmp_path, fmt, monkeypatch):
+    """The finite/ordered check is a real check (not an assert removed by -O)."""
+    import vesuvius.data.volume as vol
+    monkeypatch.setattr(vol.np, "percentile", lambda a, q, *args, **kw: np.array([np.inf, -np.inf]))
+    data = np.array([0.0, 1.0, 2.0], np.float32).reshape(1, 1, -1)
+    with pytest.raises(ValueError, match="not finite and ordered"):
+        _read(tmp_path, data, fmt, normalization_scheme="percentile_minmax")
+
+
+# FOUND C: finite_only z-score where the finite part needs scaling ([3e38, 3e38] overflows
+# the float32 mean) and is constant: no NaN from the finite z min/max.
+@pytest.mark.parametrize("bad,want_bad", [(math.inf, 0.0), (math.nan, 0.0), (-math.inf, 0.0)])
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_instance_zscore_scaled_constant_with_nonfinite(tmp_path, fmt, bad, want_bad):
+    data = np.array([3e38, 3e38, bad], np.float32).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_zscore").ravel()
+    assert np.all(np.isfinite(out))
+    np.testing.assert_array_equal(out, [0, 0, want_bad])
+
+
+# FOUND B: float32 [-1e20, 1e20]: the float32 variance (1e40) overflows.
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_instance_zscore_float32_variance_overflow(tmp_path, fmt):
+    data = np.array([-1e20, 1e20], np.float32).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_zscore").ravel()
+    np.testing.assert_allclose(out, [-1, 1], rtol=0, atol=1e-6)

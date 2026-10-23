@@ -1,6 +1,7 @@
 from __future__ import annotations
 import os
 import time
+import warnings
 import yaml
 import json
 from numpy.typing import NDArray
@@ -199,6 +200,84 @@ def _minmax_to_int_exact(x, target_dtype):
     if amb.any():
         out[amb] = _exact_round_ratio(d[amb], span, T)
     return out.astype(target_dtype)
+
+
+def _nonfinite_mask(x):
+    """Boolean mask of finite voxels of float ``x``, or None when all are finite."""
+    if x.dtype.kind != 'f':
+        return None
+    fin = np.isfinite(x)
+    return None if fin.all() else fin
+
+
+def _fill_nonfinite(res, x, low, high):
+    """Set output voxels whose INPUT ``x`` is NaN/-inf to ``low`` (NaN -> 0 for min-max) and +inf to ``high``."""
+    res = np.array(res, copy=True)
+    res[np.isnan(x)] = 0.0
+    res[x == np.inf] = high
+    res[x == -np.inf] = low
+    return res
+
+
+def _narrowing_loses_range(src, cast):
+    """True if casting float src to the narrower float cast overflowed a finite value
+    to +-inf, or flushed a non-zero value below the narrow type's normal range
+    (float64 1e-300 -> float32 0), which would distort any normalisation."""
+    if not np.isfinite(cast).all() and np.count_nonzero(np.isfinite(src)) > np.count_nonzero(np.isfinite(cast)):
+        return True
+    with np.errstate(invalid='ignore'):
+        nz = np.abs(src[(src != 0) & np.isfinite(src)])
+    return nz.size > 0 and nz.min() < np.finfo(cast.dtype).tiny
+
+
+def _zscore_stats(v):
+    """mean and std of v (all finite). If either overflows, compute them on v / max|v|
+    and return (mean, std, scale) in that scaled unit; else scale is None."""
+    with np.errstate(over='ignore', invalid='ignore'):
+        mean, std = np.mean(v), np.std(v)
+    if np.isfinite(mean) and np.isfinite(std):
+        return mean, std, None
+    scale = np.abs(v).max()
+    w = v / scale
+    return np.mean(w), np.std(w), scale
+
+
+def _zscore(x, mean, std, scale):
+    if scale is None:
+        return (x - mean) / max(std, 1e-8)
+    # Divide in float64: the std floor 1e-8 / scale (3e-47 for scale 3e38) underflows
+    # to 0 in float32 and would turn a constant instance into 0/0 = NaN.
+    z = (np.asarray(x / scale, np.float64) - float(mean)) / max(float(std), 1e-8 / float(scale))
+    return z.astype(np.asarray(x).dtype, copy=False)
+
+
+def _widen_if_overflow(res, src, fn):
+    """Return fn(src as float64) if the float32 result res has non-finite values where
+    src was finite (e.g. global_zscore 3e38 - (-1e38)); otherwise res unchanged."""
+    if res.dtype != np.float32 or np.isfinite(res).all():
+        return res
+    if np.count_nonzero(np.isfinite(res)) >= np.count_nonzero(np.isfinite(src)):
+        return res
+    return fn(src.astype(np.float64))
+
+
+def _stable_percentiles(values, q=(1.0, 99.0)):
+    """np.percentile, but finite and ordered for wide finite ranges.
+
+    np.percentile interpolates as a + (b - a) * t, and b - a overflows for opposite
+    extremes: np.percentile([-1e308, 1e308], (1, 99)) gives [inf, -inf]. Values are
+    halved and the result doubled only in that case, so ordinary input is unchanged.
+    """
+    with np.errstate(over='ignore', invalid='ignore'):
+        lower, upper = np.percentile(values, q)
+    if not (np.isfinite(lower) and np.isfinite(upper) and lower <= upper):
+        half = np.asarray(values).dtype.type(0.5)
+        lo2, hi2 = np.percentile(np.asarray(values) * half, q)
+        lower, upper = lo2 * 2, hi2 * 2
+    if not (np.isfinite(lower) and np.isfinite(upper) and lower <= upper):
+        raise ValueError(f"percentile_minmax: percentiles are not finite and ordered "
+                         f"(lower={lower!r}, upper={upper!r})")
+    return lower, upper
 
 
 class Volume:
@@ -1100,7 +1179,14 @@ class Volume:
             if np.issubdtype(data_slice.dtype, np.floating):
                 # If already float, ensure it's float32 for consistency
                 if data_slice.dtype != work_dtype:
-                    data_slice = data_slice.astype(work_dtype)
+                    with np.errstate(over='ignore'):
+                        cast = data_slice.astype(work_dtype)
+                    # Keep the wider float if narrowing would overflow finite values to
+                    # +-inf (float64 1e308 -> float32 inf): they must stay finite data.
+                    if (np.dtype(work_dtype).itemsize < data_slice.dtype.itemsize
+                            and _narrowing_loses_range(data_slice, cast)):
+                        cast = data_slice
+                    data_slice = cast
                     if self.verbose: print(f"  Cast existing float ({original_dtype}) to {np.dtype(work_dtype).name} for normalization.")
             elif (np.issubdtype(data_slice.dtype, np.integer)
                     and self.normalization_scheme in ('instance_minmax', 'percentile_minmax')):
@@ -1130,12 +1216,31 @@ class Volume:
             data_slice = data_slice[np.newaxis, ...]
             if self.verbose: print(f"  Added temporary channel dim for normalization: {data_slice.shape}")
 
+        # Non-finite voxels (policy "finite_only"): the per-instance statistics below are
+        # taken over the finite voxels only, so one NaN/inf no longer poisons the whole
+        # instance. In the output NaN -> 0, +inf -> the top of the range (1.0 for min-max,
+        # the largest finite z for z-score), -inf -> the bottom (0.0 / smallest finite z),
+        # matching _float_to_int_saturate. An instance with no finite voxel becomes all 0
+        # (one warning per read). Clean input takes the unchanged code path.
+        all_nonfinite_instances = 0
         if self.normalization_scheme == 'instance_zscore':
             for c in range(data_slice.shape[0]):  # Iterate over channels (or the single pseudo-channel)
-                mean = np.mean(data_slice[c])
-                std = np.std(data_slice[c])
-                # Epsilon prevents division by zero or near-zero std dev
-                data_slice[c] = (data_slice[c] - mean) / max(std, 1e-8)
+                x = data_slice[c]
+                fin = _nonfinite_mask(x)
+                if fin is None:
+                    # Epsilon prevents division by zero or near-zero std dev
+                    data_slice[c] = _zscore(x, *_zscore_stats(x))
+                    continue
+                if not fin.any():
+                    data_slice[c] = 0.0
+                    all_nonfinite_instances += 1
+                    continue
+                stats = _zscore_stats(x[fin])
+                with np.errstate(invalid='ignore', over='ignore'):
+                    z = np.asarray(_zscore(x, *stats))
+                zf = z[fin]
+                z = _fill_nonfinite(z, x, low=zf.min(), high=zf.max())
+                data_slice[c] = z
             if self.verbose: print(f"  Applied instance Z-score normalization.")
 
         elif self.normalization_scheme == 'global_zscore':
@@ -1143,7 +1248,9 @@ class Volume:
             if self.global_mean is None or self.global_std is None:
                 raise ValueError(
                     "Internal Error: global_mean/std missing for global_zscore.")  # Should be caught in init
-            data_slice = (data_slice - self.global_mean) / max(self.global_std, 1e-8)
+            gz = lambda a: (a - self.global_mean) / max(self.global_std, 1e-8)
+            with np.errstate(over='ignore'):
+                data_slice = _widen_if_overflow(gz(data_slice), data_slice, gz)
             if self.verbose: print(
                 f"  Applied global Z-score (mean={self.global_mean:.4f}, std={self.global_std:.4f}).")
 
@@ -1156,22 +1263,45 @@ class Volume:
 
         elif self.normalization_scheme == 'instance_minmax':
             for c in range(data_slice.shape[0]):
-                min_val = np.min(data_slice[c])
-                max_val = np.max(data_slice[c])
-                if np.isfinite(min_val) and np.isfinite(max_val) and not np.isfinite(max_val - min_val):
-                    # Finite range wider than the float type (e.g. [-1e308, 1e308]): halve
-                    # first so neither the range nor x - min overflows to inf.
-                    half = data_slice.dtype.type(0.5)
-                    data_slice[c] = (data_slice[c] * half - min_val * half) / (max_val * half - min_val * half)
+                x = data_slice[c]
+                fin = _nonfinite_mask(x)
+                if fin is not None and not fin.any():
+                    data_slice[c] = 0.0
+                    all_nonfinite_instances += 1
                     continue
-                denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
-                data_slice[c] = (data_slice[c] - min_val) / denominator
+                stats = x if fin is None else x[fin]
+                min_val = np.min(stats)
+                max_val = np.max(stats)
+                with np.errstate(invalid='ignore', over='ignore'):
+                    if np.isfinite(min_val) and np.isfinite(max_val) and not np.isfinite(max_val - min_val):
+                        # Finite range wider than the float type (e.g. [-1e308, 1e308]): halve
+                        # first so neither the range nor x - min overflows to inf.
+                        half = data_slice.dtype.type(0.5)
+                        res = (x * half - min_val * half) / (max_val * half - min_val * half)
+                    else:
+                        denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
+                        res = (x - min_val) / denominator
+                if fin is not None:
+                    res = _fill_nonfinite(np.asarray(res), x, low=0.0, high=1.0)
+                data_slice[c] = res
             if self.verbose: print(f"  Applied instance Min-Max scaling to [0, 1].")
 
         elif self.normalization_scheme == 'percentile_minmax':
             for c in range(data_slice.shape[0]):
-                lower, upper = np.percentile(data_slice[c], (1.0, 99.0))
-                denominator = float(upper - lower)
+                fin = _nonfinite_mask(data_slice[c])
+                if fin is not None and not fin.any():
+                    data_slice[c] = 0.0
+                    all_nonfinite_instances += 1
+                    continue
+                if fin is not None:
+                    # clip below maps +inf/-inf to the finite percentiles; NaN -> 0 after
+                    x_orig = np.array(data_slice[c], copy=True)
+                    lower, upper = _stable_percentiles(x_orig[fin])
+                    data_slice[c] = np.nan_to_num(x_orig, nan=lower, posinf=upper, neginf=lower)
+                else:
+                    lower, upper = _stable_percentiles(data_slice[c])
+                with np.errstate(over='ignore'):
+                    denominator = float(upper - lower)
                 if np.isfinite(lower) and np.isfinite(upper) and not np.isfinite(denominator):
                     half = data_slice.dtype.type(0.5)  # finite but overflowing range, see instance_minmax
                     clipped = np.clip(data_slice[c], lower, upper)
@@ -1181,6 +1311,8 @@ class Volume:
                 else:
                     clipped = np.clip(data_slice[c], lower, upper)
                     data_slice[c] = (clipped - lower) / denominator
+                if fin is not None:
+                    data_slice[c] = _fill_nonfinite(np.asarray(data_slice[c]), x_orig, low=0.0, high=1.0)
             if self.verbose: print(f"  Applied percentile Min-Max scaling to [0, 1].")
 
         elif self.normalization_scheme == 'ct':
@@ -1190,13 +1322,19 @@ class Volume:
             mean = float(self.intensity_props['mean'])
             std = float(self.intensity_props['std'])
             # Clip in-place per channel
-            data_slice = np.clip(data_slice, lb, ub)
-            data_slice = (data_slice - mean) / max(std, 1e-8)
+            ctz = lambda a: (np.clip(a, lb, ub) - mean) / max(std, 1e-8)
+            with np.errstate(over='ignore'):
+                data_slice = _widen_if_overflow(ctz(data_slice), data_slice, ctz)
             if self.verbose: print(
                 f"  Applied CT normalization (clip to [{lb:.4f}, {ub:.4f}], mean={mean:.4f}, std={std:.4f}).")
 
         elif self.normalization_scheme != 'none':
             raise ValueError(f"Internal Error: Unknown normalization scheme '{self.normalization_scheme}' encountered.")
+
+        if all_nonfinite_instances:
+            warnings.warn(
+                f"Volume read: {all_nonfinite_instances} normalization instance(s) contain no finite "
+                f"value; returned as 0 ({self.normalization_scheme}).", RuntimeWarning, stacklevel=2)
 
         # Remove temporary channel dimension if it was added
         if not has_channel_dim and original_ndim == 3 and data_slice.ndim == 4:
