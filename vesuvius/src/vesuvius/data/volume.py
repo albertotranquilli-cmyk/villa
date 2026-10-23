@@ -130,8 +130,10 @@ def _float_to_int_saturate(arr, target_dtype):
 def _subtract_instance_min_exact(arr, work_dtype):
     """Return ``arr - min`` per normalization instance, computed exactly, as ``work_dtype``.
 
-    Instances follow ``Volume.__getitem__``'s min-max loop: a 3D array is one
-    instance, otherwise each index along axis 0 is one. The difference of two
+    A read with more than 3 dims is shifted per channel (axis 0); any other read
+    by its overall minimum. Subtracting a constant never changes a min-max
+    result, so this is correct whichever sub-instances the normalization loop
+    then uses (e.g. per row of a 2D read, or the whole read). The difference of two
     values of any integer dtype fits in uint64 (0 <= x - min <= 2**64 - 1), and
     modular uint64 subtraction of the two's-complement bit patterns gives it
     exactly, for signed and unsigned inputs alike.
@@ -140,7 +142,7 @@ def _subtract_instance_min_exact(arr, work_dtype):
     as_u64 = (arr.astype(np.int64, copy=False).view(np.uint64)
               if np.issubdtype(arr.dtype, np.signedinteger) else arr.astype(np.uint64, copy=False))
     out = np.empty(arr.shape, dtype=work_dtype)
-    groups = [(Ellipsis,)] if arr.ndim == 3 else [(i,) for i in range(arr.shape[0])]
+    groups = [(i,) for i in range(arr.shape[0])] if arr.ndim > 3 else [(Ellipsis,)]
     for g in groups:
         mn = np.min(arr[g])
         mn_u64 = (np.array(mn, dtype=np.int64).view(np.uint64)

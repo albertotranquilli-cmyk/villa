@@ -258,3 +258,24 @@ def test_minmax_nonfinite_policy_pinned(tmp_path, fmt, vals):
     data = np.array(vals, dtype=np.float32).reshape(1, 1, -1)
     out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type="np.uint8")
     np.testing.assert_array_equal(out, [0, 0, 0])
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("scheme", ["instance_minmax", "percentile_minmax"])
+def test_minmax_2d_read_64bit_keeps_contrast(tmp_path, fmt, scheme):
+    # 2D read (volume[z, :, :]): whichever grouping normalization uses, the
+    # top-of-range uint64 values must keep their contrast.
+    data = np.array([[_U64MAX - 3, _U64MAX - 2, _U64MAX - 1, _U64MAX]] * 2, dtype=np.uint64).reshape(1, 2, 4)
+    path = str(tmp_path / f"d{fmt}.zarr")
+    if _ZARR_MAJOR >= 3:
+        a = zarr.open_group(path, mode="w", zarr_format=fmt).create_array(
+            name="0", shape=data.shape, chunks=data.shape, dtype=data.dtype)
+    else:
+        a = zarr.open_group(path, mode="w").zeros(name="0", shape=data.shape, chunks=data.shape, dtype=data.dtype)
+    a[...] = data
+    v = Volume(type="zarr", path=path, verbose=False, normalization_scheme=scheme, return_as_type="np.uint8")
+    out = v[0, 0:2, 0:4]
+    assert out.shape == (2, 4)
+    for row in out:
+        assert int(row[0]) == 0 and int(row[-1]) == 255
+        assert np.all(np.diff(row.astype(np.int64)) > 0)
