@@ -545,7 +545,7 @@ def _gz_ct_kw(scheme, mean, std, lb=-np.finfo(np.float64).max, ub=np.finfo(np.fl
     (-1e308, 1e308, 1e308, -2.0),
     (1e308, -1e308, 4.0, 5e307),
 ])
-def test_overflow_path_halving_is_exact(tmp_path, fmt, scheme, x, mean, std, expected):
+def test_variance_overflow_path_halving_is_exact(tmp_path, fmt, scheme, x, mean, std, expected):
     data = np.full((1, 1, 1), x, np.float64)
     out = _read(tmp_path, data, fmt, normalization_scheme=scheme, return_as_type="np.float64",
                 **_gz_ct_kw(scheme, mean, std))
@@ -556,7 +556,7 @@ def test_overflow_path_halving_is_exact(tmp_path, fmt, scheme, x, mean, std, exp
 # (5e-324 * 0.5 -> 0.0). Non-overflowing voxels must keep the plain (x - mean) / std.
 @pytest.mark.parametrize("scheme", ["global_zscore", "ct"])
 @pytest.mark.parametrize("fmt", FORMATS)
-def test_subnormal_inputs_do_not_take_the_halving_path(tmp_path, fmt, scheme):
+def test_no_overflow_subnormal_inputs_skip_the_halving_path(tmp_path, fmt, scheme):
     data = np.array([[[5e-324, 1.5e-323, -5e-324]]], np.float64)
     out = _read(tmp_path, data, fmt, normalization_scheme=scheme, return_as_type="np.float64",
                 **_gz_ct_kw(scheme, 0.0, 1.0))
