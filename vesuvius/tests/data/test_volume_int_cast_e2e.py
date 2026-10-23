@@ -250,14 +250,61 @@ def test_minmax_multichannel_is_shifted_per_channel(tmp_path, fmt):
     np.testing.assert_array_equal(out.reshape(2, 2), [[0, 255], [0, 255]])
 
 
-# Non-finite input: policy pinned as-is (one NaN/inf voxel zeroes the instance).
-# This documents current behaviour; it is not an endorsement (REDTEAM-020 FOUND #3).
+# Non-finite input, policy "finite_only" (REDTEAM-020 FOUND #3): statistics over the
+# finite voxels; NaN -> 0, +inf -> top of range, -inf -> bottom; no finite voxel -> 0 + one warning.
+_SCHEMES3 = ["instance_minmax", "percentile_minmax", "instance_zscore"]
+
+
+def _read_any(tmp_path, data, fmt, name, **kw):
+    sub = tmp_path / name
+    sub.mkdir()
+    return _read(sub, data, fmt, **kw)
+
+
 @pytest.mark.parametrize("fmt", FORMATS)
-@pytest.mark.parametrize("vals", [[0, 1, math.nan], [0, 1, math.inf], [-math.inf, 0, 1]])
-def test_minmax_nonfinite_policy_pinned(tmp_path, fmt, vals):
-    data = np.array(vals, dtype=np.float32).reshape(1, 1, -1)
+@pytest.mark.parametrize("scheme", _SCHEMES3)
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+@pytest.mark.parametrize("rt", [None, "np.float32", "np.uint8", "np.uint16"])
+def test_nonfinite_voxel_does_not_poison_instance(tmp_path, fmt, scheme, bad, rt):
+    clean = np.linspace(10, 110, 64, dtype=np.float32)
+    data = clean.copy()
+    data[20] = bad
+    kw = dict(normalization_scheme=scheme)
+    if rt:
+        kw["return_as_type"] = rt
+    out = _read_any(tmp_path, data.reshape(1, 1, -1), fmt, "a", **kw)
+    keep = np.ones(64, bool)
+    keep[20] = False
+    ref = _read_any(tmp_path, clean[keep].reshape(1, 1, -1), fmt, "b", **kw)
+    np.testing.assert_array_equal(out[keep], ref)  # finite voxels: as if the bad one were absent
+    assert np.all(np.isfinite(out.astype(np.float64)))
+    if scheme == "instance_zscore":
+        want = {"nan": 0.0, "inf": ref.max(), "-inf": ref.min()}[str(bad)]
+    else:
+        top = 1.0 if rt in (None, "np.float32") else np.iinfo(rt.replace("np.", "")).max
+        want = {"nan": 0, "inf": top, "-inf": 0}[str(bad)]
+    assert out[20] == want
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("scheme", _SCHEMES3)
+@pytest.mark.parametrize("rt", [None, "np.uint8"])
+def test_all_nonfinite_instance_is_zero_with_one_warning(tmp_path, fmt, scheme, rt):
+    data = np.array([math.nan, math.inf, -math.inf, math.nan], np.float32).reshape(1, 1, -1)
+    kw = dict(normalization_scheme=scheme)
+    if rt:
+        kw["return_as_type"] = rt
+    with pytest.warns(RuntimeWarning, match="no finite") as rec:
+        out = _read(tmp_path, data, fmt, **kw)
+    assert len([w for w in rec if "no finite" in str(w.message)]) == 1
+    np.testing.assert_array_equal(out, [0, 0, 0, 0])
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_nonfinite_with_huge_finite_range(tmp_path, fmt):
+    data = np.array([-1e38, 0, 1e38, math.nan, math.inf], np.float32).reshape(1, 1, -1)
     out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type="np.uint8")
-    np.testing.assert_array_equal(out, [0, 0, 0])
+    np.testing.assert_array_equal(out, [0, 128, 255, 0, 255])
 
 
 @pytest.mark.parametrize("fmt", FORMATS)
