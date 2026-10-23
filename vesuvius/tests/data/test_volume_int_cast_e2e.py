@@ -527,3 +527,92 @@ def test_representable_float64_normalization(tmp_path, fmt, scheme):
                                "percentile_00_5": -1e308, "percentile_99_5": 1e308}})
     out = _read(tmp_path, data, fmt, normalization_scheme=scheme, return_as_type="np.float64", **kw)
     np.testing.assert_allclose(out, [2.0])
+
+
+def _gz_ct_kw(scheme, mean, std, lb=-np.finfo(np.float64).max, ub=np.finfo(np.float64).max):
+    if scheme == "global_zscore":
+        return {"global_mean": mean, "global_std": std}
+    return {"intensity_props": {"mean": mean, "std": std, "percentile_00_5": lb, "percentile_99_5": ub}}
+
+
+# The overflow path computes ((x/2 - mean/2) / std) * 2. Exact equality pins both halvings
+# and the doubling: dropping any of them gives inf or a result off by a factor of 2.
+@pytest.mark.parametrize("scheme", ["global_zscore", "ct"])
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("x, mean, std, expected", [
+    (1e308, -1e308, 1e308, 2.0),
+    (1.5e308, -1e308, 1e308, 2.5),
+    (-1e308, 1e308, 1e308, -2.0),
+    (1e308, -1e308, 4.0, 5e307),
+])
+def test_overflow_path_halving_is_exact(tmp_path, fmt, scheme, x, mean, std, expected):
+    data = np.full((1, 1, 1), x, np.float64)
+    out = _read(tmp_path, data, fmt, normalization_scheme=scheme, return_as_type="np.float64",
+                **_gz_ct_kw(scheme, mean, std))
+    np.testing.assert_array_equal(out, [expected])
+
+
+# Halving is exact only in the normal range: x * 0.5 loses the last bit of a subnormal
+# (5e-324 * 0.5 -> 0.0). Non-overflowing voxels must keep the plain (x - mean) / std.
+@pytest.mark.parametrize("scheme", ["global_zscore", "ct"])
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_subnormal_inputs_do_not_take_the_halving_path(tmp_path, fmt, scheme):
+    data = np.array([[[5e-324, 1.5e-323, -5e-324]]], np.float64)
+    out = _read(tmp_path, data, fmt, normalization_scheme=scheme, return_as_type="np.float64",
+                **_gz_ct_kw(scheme, 0.0, 1.0))
+    np.testing.assert_array_equal(out, [5e-324, 1.5e-323, -5e-324])
+    assert out[2] != 0.0 and np.signbit(out[2])  # -5e-324, not -0.0
+
+
+def _read_4d(tmp_path, data, fmt, **kw):
+    path = str(tmp_path / f"v4d{fmt}.zarr")
+    if _ZARR_MAJOR >= 3:
+        a = zarr.open_group(path, mode="w", zarr_format=fmt).create_array(
+            name="0", shape=data.shape, chunks=data.shape, dtype=data.dtype)
+    else:
+        a = zarr.open_group(path, mode="w").zeros(name="0", shape=data.shape, chunks=data.shape, dtype=data.dtype)
+    a[...] = data
+    v = Volume(type="zarr", path=path, verbose=False, **kw)
+    return np.asarray(v[0:data.shape[0], 0:data.shape[1], 0:data.shape[2], 0:data.shape[3]])
+
+
+# Array-valued global_mean is not a supported per-channel API, but it broadcasts like
+# numpy, and the overflow path must broadcast the same way instead of raising.
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_overflow_path_with_c111_mean(tmp_path, fmt):
+    data = np.array([[1e308, 0.0], [1.0, 2.0], [-1e308, 5.0]], np.float64).reshape(3, 1, 1, 2)
+    mean = np.array([-1e308, 0.0, 1e308]).reshape(3, 1, 1, 1)
+    out = _read_4d(tmp_path, data, fmt, normalization_scheme="global_zscore", return_as_type="np.float64",
+                   global_mean=mean, global_std=1e308)
+    expected = np.array([[2.0, 1.0], [1.0 / 1e308, 2.0 / 1e308], [-2.0, (5.0 - 1e308) / 1e308]]).reshape(3, 1, 1, 2)
+    np.testing.assert_array_equal(out, expected)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_overflow_path_with_list_mean(tmp_path, fmt):
+    # A list mean broadcasts along the last axis (X), as on main.
+    data = np.array([[[1e308, 1.0, 2.0]]], np.float64)
+    out = _read(tmp_path, data, fmt, normalization_scheme="global_zscore", return_as_type="np.float64",
+                global_mean=[-1e308, 0.0, 0.0], global_std=1e308)
+    np.testing.assert_array_equal(out, [2.0, 1.0 / 1e308, 2.0 / 1e308])
+
+
+# int64 with one outlier at -2**63: after the exact min shift, 0..998 sit near 2**63, where
+# float64 cannot tell them apart, so p1 == p99 and the whole instance came back 0.
+@pytest.mark.parametrize("src", ["int64", "uint64"])
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_percentile_minmax_wide_integer_span(tmp_path, fmt, src):
+    base = np.arange(999)
+    outlier = np.iinfo(src).min if src == "int64" else np.iinfo(src).max
+    data = np.concatenate([[outlier], base]).astype(src).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="percentile_minmax", return_as_type="np.float64")
+    vals = data.ravel().astype(object)
+    s = sorted(vals)
+    def pct(q):
+        h = Fraction(len(s) - 1) * Fraction(q) / 100
+        i = int(h)
+        return Fraction(int(s[i])) + (h - i) * (int(s[i + 1]) - int(s[i]))
+    lo, hi = pct(1), pct(99)
+    expected = [float((min(max(Fraction(int(v)), lo), hi) - lo) / (hi - lo)) for v in vals]
+    np.testing.assert_allclose(out, expected, rtol=1e-6, atol=1e-7)  # float32 work dtype
+    assert 0.07 < out[100] < 0.1

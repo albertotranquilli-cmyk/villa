@@ -132,7 +132,7 @@ def _float_to_int_saturate(arr, target_dtype, inplace=False):
     out[lo] = tinfo.min
     return out
 
-def _subtract_instance_min_exact(arr, work_dtype):
+def _subtract_instance_min_exact(arr, work_dtype, percentile=False):
     """Return ``arr - min`` per normalization instance, computed exactly, as ``work_dtype``.
 
     A read with more than 3 dims is shifted per channel (axis 0); any other read
@@ -142,6 +142,15 @@ def _subtract_instance_min_exact(arr, work_dtype):
     values of any integer dtype fits in uint64 (0 <= x - min <= 2**64 - 1), and
     modular uint64 subtraction of the two's-complement bit patterns gives it
     exactly, for signed and unsigned inputs alike.
+
+    ``percentile=True`` (percentile_minmax): if the span max - min is not exact in
+    ``work_dtype`` and the shifted values leave too few representable steps between the
+    percentiles (int64 [-2**63, 0..999] -> 0..999 near 2**63 in float64, so p1 == p99),
+    the instance is instead shifted by the order statistic just below the 1st
+    percentile, and values below it map to -1. The map is monotone, so the
+    order statistics, and hence the percentiles, are those of the exact values,
+    and everything outside [p1, p99] is clipped afterwards anyway. Spans that are
+    exact keep the min shift, so ordinary data is unchanged.
     """
     arr = np.asarray(arr)
     as_u64 = (arr.astype(np.int64, copy=False).view(np.uint64)
@@ -152,7 +161,31 @@ def _subtract_instance_min_exact(arr, work_dtype):
         mn = np.min(arr[g])
         mn_u64 = (np.array(mn, dtype=np.int64).view(np.uint64)
                   if np.issubdtype(arr.dtype, np.signedinteger) else np.uint64(mn))
-        out[g] = (as_u64[g] - mn_u64).astype(work_dtype)
+        d = as_u64[g] - mn_u64
+        if percentile:
+            exact_span = 2 ** (np.finfo(work_dtype).nmant + 1)
+            shifted = d.astype(work_dtype)
+            if int(np.max(d)) > exact_span:
+                # Only if the min shift really degrades the [p1, p99] window: fewer than
+                # ~1024 representable steps between the percentiles (0..999 near 2**63
+                # in float64 have none). Otherwise keep the min shift (same bytes).
+                lo, hi = np.percentile(shifted, (1.0, 99.0))
+                coarse = (hi - lo) < 1024 * np.spacing(np.asarray(max(abs(lo), abs(hi)), dtype=work_dtype))
+            else:
+                coarse = False
+            if coarse:
+                flat = np.asarray(arr[g]).ravel()
+                k = max(int(np.floor((flat.size - 1) * 0.01)) - 1, 0)
+                ref = np.partition(flat, k)[k]
+                ref_u64 = (np.array(ref, dtype=np.int64).view(np.uint64)
+                           if np.issubdtype(arr.dtype, np.signedinteger) else np.uint64(ref))
+                o = (as_u64[g] - ref_u64).astype(work_dtype)
+                o[np.asarray(arr[g]) < ref] = -1
+                out[g] = o
+                continue
+            out[g] = shifted
+            continue
+        out[g] = d.astype(work_dtype)
     return out
 
 
@@ -262,7 +295,8 @@ def _widen_if_overflow(res, src, fn, stable):
        3e38 - (-1e38)), as before.
     2. Voxels still non-finite (x - mean overflows even in float64, e.g. 1e308 -
        (-1e308)) are recomputed with ``stable`` (((x/2 - mean/2) / std) * 2: halving is
-       exact, a true overflow still gives inf); the others keep
+       exact in the normal range, a true overflow still gives inf); it is applied only to
+       overflowing voxels (halving a subnormal would lose a bit); the others keep
        the plain result, so ordinary data is unchanged.
     """
     if np.isfinite(res).all():
@@ -274,7 +308,9 @@ def _widen_if_overflow(res, src, fn, stable):
     bad = ~np.isfinite(res) & np.isfinite(src)
     if bad.any():
         res = np.array(res, copy=True)
-        res[bad] = np.asarray(stable(src[bad]), dtype=res.dtype)
+        # stable() on the whole array: mean/std may be arrays that broadcast against
+        # src (e.g. a (C,1,1,1) mean), which src[bad] (1-D) would not.
+        res[bad] = np.asarray(np.broadcast_to(stable(src), res.shape), dtype=res.dtype)[bad]
     return res
 
 
@@ -1231,7 +1267,8 @@ class Volume:
                 # int64 -1 in [-2**63, 2**63-1] -> uint8 128 instead of 127).
                 if not (exact_int_minmax and data_slice.dtype.itemsize <= 2):  # 8/16-bit: LUT on raw values
                     data_slice = _subtract_instance_min_exact(
-                        data_slice, np.uint64 if exact_int_minmax else work_dtype)
+                        data_slice, np.uint64 if exact_int_minmax else work_dtype,
+                        percentile=self.normalization_scheme == 'percentile_minmax')
                 if self.verbose: print(f"  Shifted {original_dtype} by its instance minimum and cast to {np.dtype(work_dtype).name}.")
             else:
                 # If integer or other, convert to float32
@@ -1287,7 +1324,7 @@ class Volume:
                 # Same arithmetic as (a - mean) / gs, in place on the subtraction temporary.
                 t = np.subtract(a, self.global_mean)
                 return np.divide(t, gs, out=t)
-            gz_stable = lambda a: ((a * 0.5 - self.global_mean * 0.5) / gs) * 2  # x - mean overflows; halving is exact
+            gz_stable = lambda a: ((a * 0.5 - np.asarray(self.global_mean) * 0.5) / gs) * 2  # x - mean overflows; halving is exact in the normal range; applied only to overflowing voxels
             with np.errstate(over='ignore', invalid='ignore'):
                 data_slice = _widen_if_overflow(gz(data_slice), data_slice, gz, gz_stable)
             if self.verbose: print(
@@ -1372,7 +1409,7 @@ class Volume:
                 # Same arithmetic as (clip(a) - mean) / cs, in place on the clip temporary.
                 t = np.clip(a, lb, ub)
                 return np.divide(np.subtract(t, mean, out=t), cs, out=t)
-            ctz_stable = lambda a: ((np.clip(a, lb, ub) * 0.5 - mean * 0.5) / cs) * 2  # x - mean overflows; halving is exact
+            ctz_stable = lambda a: ((np.clip(a, lb, ub) * 0.5 - mean * 0.5) / cs) * 2  # x - mean overflows; halving is exact in the normal range; applied only to overflowing voxels
             with np.errstate(over='ignore', invalid='ignore'):
                 data_slice = _widen_if_overflow(ctz(data_slice), data_slice, ctz, ctz_stable)
             if self.verbose: print(
