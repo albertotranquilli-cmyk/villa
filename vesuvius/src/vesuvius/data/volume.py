@@ -104,8 +104,20 @@ def _float_to_int_saturate(arr, target_dtype):
     """
     tinfo = np.iinfo(target_dtype)
     a = np.rint(np.asarray(arr, dtype=np.float64))
-    a = np.nan_to_num(a, nan=0.0, posinf=float(tinfo.max), neginf=float(tinfo.min))
-    return np.clip(a, tinfo.min, tinfo.max).astype(target_dtype)
+    # Saturate in the integer domain: float64 cannot represent int64/uint64 max
+    # (float(max) rounds up to 2**63 / 2**64), so clipping in float then casting
+    # would overflow. Both bounds below are exact powers of two (or zero).
+    upper = 2.0 ** (tinfo.bits - 1 if tinfo.min < 0 else tinfo.bits)  # == max + 1
+    lower = float(tinfo.min)
+    hi = a >= upper  # includes +inf
+    lo = a < lower   # includes -inf
+    nan = np.isnan(a)
+    interior = ~(hi | lo | nan)
+    out = np.zeros(a.shape, dtype=target_dtype)
+    out[interior] = a[interior].astype(target_dtype)
+    out[hi] = tinfo.max
+    out[lo] = tinfo.min
+    return out
 
 class Volume:
     """

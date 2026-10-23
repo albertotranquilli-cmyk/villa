@@ -102,3 +102,46 @@ def test_sweep_no_wrap(tmp_path, src, tgt):
         if not (np.issubdtype(src, np.unsignedinteger) and np.issubdtype(tgt, np.unsignedinteger)):
             assert o[-1] == min(info.max, s[-1])
             assert np.all(o[s < 0] <= 0) and np.all(o[s > 0] >= 0)
+
+
+# --- 64-bit integer targets: float64 cannot represent int64/uint64 max ---
+@pytest.mark.parametrize("tgt", [np.int64, np.uint64])
+def test_minmax_endpoints_64bit(tmp_path, tgt):
+    data = np.array([0, 0.5, 1], np.float32).reshape(1, 1, 3)
+    out = _vol(tmp_path, data, normalization_scheme="instance_minmax",
+               return_as_type=f"np.{np.dtype(tgt).name}")[0:1, 0:1, 0:3].ravel()
+    assert out.dtype == tgt
+    assert int(out[0]) == 0 and int(out[2]) == int(np.iinfo(tgt).max)
+
+
+@pytest.mark.parametrize("src", [np.float32, np.float64])
+@pytest.mark.parametrize("tgt", [np.int64, np.uint64])
+def test_float_to_64bit_saturates(tmp_path, src, tgt):
+    info = np.iinfo(tgt)
+    vals = [np.nan, np.inf, -np.inf, 2.0**64, -2.0**64, 2.0**63, -2.0**63,
+            np.finfo(src).max, -np.finfo(src).max, 1.0, 2.0**53]
+    data = np.array(vals, src).reshape(1, 1, -1)
+    out = _vol(tmp_path, data, return_as_type=f"np.{np.dtype(tgt).name}")[0:1, 0:1, 0:len(vals)].ravel()
+    hi, lo = int(info.max), int(info.min)
+
+    def oracle(v):
+        if np.isnan(v):
+            return 0
+        if v == np.inf:
+            return hi
+        if v == -np.inf:
+            return lo
+        return min(hi, max(lo, int(v)))
+    assert [int(x) for x in out] == [oracle(float(v)) for v in data.ravel()]
+
+
+@pytest.mark.parametrize("src", _DT[:6] + [np.int64, np.uint64])
+@pytest.mark.parametrize("tgt", [np.int64, np.uint64])
+def test_int_to_64bit_extremes(tmp_path, src, tgt):
+    data = _extremes(src).reshape(1, 1, -1)
+    n = data.shape[-1]
+    out = _vol(tmp_path, data, return_as_type=f"np.{np.dtype(tgt).name}")[0:1, 0:1, 0:n].ravel()
+    info = np.iinfo(tgt)
+    assert out.dtype == tgt
+    expected = [min(int(info.max), max(int(info.min), int(v))) for v in data.ravel()]
+    assert [int(x) for x in out] == expected
