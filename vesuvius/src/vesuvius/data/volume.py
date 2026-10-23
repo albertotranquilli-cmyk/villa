@@ -93,6 +93,20 @@ from .utils import get_max_value, open_zarr
 Image.MAX_IMAGE_PIXELS = None
 
 
+
+def _float_to_int_saturate(arr, target_dtype):
+    """Round float data to ``target_dtype`` with saturation instead of wrapping.
+
+    Computed in float64 (float32 cannot represent 2**31-1 or 2**32-1, so clipping
+    in float32 rounds the bound up and the cast wraps). Policy: NaN -> 0,
+    +inf -> target max, -inf -> target min, finite values are rounded half to
+    even and clipped to the target range.
+    """
+    tinfo = np.iinfo(target_dtype)
+    a = np.rint(np.asarray(arr, dtype=np.float64))
+    a = np.nan_to_num(a, nan=0.0, posinf=float(tinfo.max), neginf=float(tinfo.min))
+    return np.clip(a, tinfo.min, tinfo.max).astype(target_dtype)
+
 class Volume:
     """
     A class to represent a 3D volume in a scroll or segment.
@@ -1054,7 +1068,8 @@ class Volume:
                     if self.normalization_scheme in ['instance_minmax', 'percentile_minmax']:  # Data is in [0, 1] range
                         max_target_val = get_max_value(target_dtype)
                         # Scale to target range, clip just in case due to float precision
-                        data_slice = np.clip(np.rint(data_slice * max_target_val), 0, max_target_val)
+                        data_slice = _float_to_int_saturate(
+                            np.asarray(data_slice, dtype=np.float64) * max_target_val, target_dtype)
                         final_dtype = target_dtype
                         if self.verbose: print(f"  Scaled [0,1] data to target integer {target_dtype_str}.")
                     elif self.normalization_scheme in ['instance_zscore', 'global_zscore']:
@@ -1075,7 +1090,7 @@ class Volume:
                             shift = np.iinfo(src_dtype).bits - tinfo.bits
                             data_slice = data_slice >> shift
                         elif np.issubdtype(src_dtype, np.floating):
-                            data_slice = np.clip(np.rint(data_slice), tinfo.min, tinfo.max)
+                            data_slice = _float_to_int_saturate(data_slice, target_dtype)
                         elif np.issubdtype(src_dtype, np.integer) and not np.can_cast(src_dtype, target_dtype):
                             data_slice = np.clip(data_slice, tinfo.min, tinfo.max)
                         final_dtype = target_dtype
