@@ -184,3 +184,77 @@ def test_percentile_minmax_int_target_in_range(tmp_path, fmt, tgt):
     assert out.dtype == np.dtype(tgt)
     assert int(out[0]) == 0 and int(out[-1]) == ti.max
     assert np.all(np.diff(out.astype(np.float64)) >= 0)
+
+
+# --- REDTEAM-020: 64-bit integer inputs must not collapse before min/max ---
+_U64MAX, _I64MIN, _I64MAX = 2**64 - 1, -2**63, 2**63 - 1
+
+
+def _minmax_oracle(vals, tgt):
+    xs = [Fraction(v) for v in vals]
+    lo, hi = min(xs), max(xs)
+    m = np.iinfo(tgt).max
+    return [0 if hi == lo else round((x - lo) / (hi - lo) * m) for x in xs]
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("tgt", ["uint8", "uint32", "uint64"])
+@pytest.mark.parametrize("scheme", ["instance_minmax", "percentile_minmax"])
+@pytest.mark.parametrize("src,vals", [
+    ("uint64", [_U64MAX - 1, _U64MAX]),
+    ("uint64", [_U64MAX - 2, _U64MAX - 1, _U64MAX]),
+    ("uint64", [0, 1, 2]),
+    ("int64", [_I64MAX - 1, _I64MAX]),
+    ("int64", [_I64MIN, _I64MIN + 1, _I64MIN + 2]),
+    ("int64", [_I64MIN, -1, 0, _I64MAX]),
+    ("uint64", [0, 2**63, _U64MAX]),
+])
+def test_minmax_64bit_close_values_keep_contrast(tmp_path, fmt, tgt, scheme, src, vals):
+    data = np.array(vals, dtype=src).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme=scheme, return_as_type=f"np.{tgt}")
+    if scheme == "percentile_minmax":
+        # percentile endpoints are interpolated; endpoints and order are exact
+        assert int(out[0]) == 0 and int(out[-1]) == np.iinfo(tgt).max
+        assert np.all(np.diff(out.astype(np.float64)) >= 0)
+        return
+    exact = _minmax_oracle(vals, tgt)
+    for got, want in zip(out, exact):
+        assert abs(int(got) - want) <= _minmax_tolerance(np.dtype(tgt), want), (list(out), exact)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("tgt", ["uint8", "uint64"])
+@pytest.mark.parametrize("src", ["float32", "float64"])
+def test_minmax_finite_range_wider_than_float(tmp_path, fmt, tgt, src):
+    big = float(np.finfo(src).max) / 1.5
+    data = np.array([-big, 0.0, big], dtype=src).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type=f"np.{tgt}")
+    m = np.iinfo(tgt).max
+    assert int(out[0]) == 0 and int(out[2]) == m
+    assert abs(int(out[1]) - round(Fraction(m, 2))) <= _minmax_tolerance(np.dtype(tgt), m // 2)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_minmax_multichannel_is_shifted_per_channel(tmp_path, fmt):
+    path = str(tmp_path / f"c{fmt}.zarr")
+    data = np.array([[_U64MAX - 1, _U64MAX], [0, 7]], dtype=np.uint64).reshape(2, 1, 1, 2)
+    if _ZARR_MAJOR >= 3:
+        a = zarr.open_group(path, mode="w", zarr_format=fmt).create_array(
+            name="0", shape=data.shape, chunks=data.shape, dtype=data.dtype)
+    else:
+        a = zarr.open_group(path, mode="w").zeros(name="0", shape=data.shape, chunks=data.shape, dtype=data.dtype)
+    a[...] = data
+    v = Volume(type="zarr", path=path, verbose=False, normalization_scheme="instance_minmax",
+               return_as_type="np.uint8")
+    out = v[0:2, 0:1, 0:1, 0:2]
+    np.testing.assert_array_equal(out.reshape(2, 2), [[0, 255], [0, 255]])
+
+
+# Non-finite input: policy pinned as-is (one NaN/inf voxel zeroes the instance).
+# This documents current behaviour; it is not an endorsement (REDTEAM-020 FOUND #3).
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("vals", [[0, 1, math.nan], [0, 1, math.inf], [-math.inf, 0, 1]])
+def test_minmax_nonfinite_policy_pinned(tmp_path, fmt, vals):
+    data = np.array(vals, dtype=np.float32).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type="np.uint8")
+    np.testing.assert_array_equal(out, [0, 0, 0])

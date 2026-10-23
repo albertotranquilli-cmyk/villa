@@ -127,6 +127,28 @@ def _float_to_int_saturate(arr, target_dtype):
     out[lo] = tinfo.min
     return out
 
+def _subtract_instance_min_exact(arr, work_dtype):
+    """Return ``arr - min`` per normalization instance, computed exactly, as ``work_dtype``.
+
+    Instances follow ``Volume.__getitem__``'s min-max loop: a 3D array is one
+    instance, otherwise each index along axis 0 is one. The difference of two
+    values of any integer dtype fits in uint64 (0 <= x - min <= 2**64 - 1), and
+    modular uint64 subtraction of the two's-complement bit patterns gives it
+    exactly, for signed and unsigned inputs alike.
+    """
+    arr = np.asarray(arr)
+    as_u64 = (arr.astype(np.int64, copy=False).view(np.uint64)
+              if np.issubdtype(arr.dtype, np.signedinteger) else arr.astype(np.uint64, copy=False))
+    out = np.empty(arr.shape, dtype=work_dtype)
+    groups = [(Ellipsis,)] if arr.ndim == 3 else [(i,) for i in range(arr.shape[0])]
+    for g in groups:
+        mn = np.min(arr[g])
+        mn_u64 = (np.array(mn, dtype=np.int64).view(np.uint64)
+                  if np.issubdtype(arr.dtype, np.signedinteger) else np.uint64(mn))
+        out[g] = (as_u64[g] - mn_u64).astype(work_dtype)
+    return out
+
+
 class Volume:
     """
     A class to represent a 3D volume in a scroll or segment.
@@ -1027,6 +1049,14 @@ class Volume:
                 if data_slice.dtype != work_dtype:
                     data_slice = data_slice.astype(work_dtype)
                     if self.verbose: print(f"  Cast existing float ({original_dtype}) to {np.dtype(work_dtype).name} for normalization.")
+            elif (np.issubdtype(data_slice.dtype, np.integer)
+                    and self.normalization_scheme in ('instance_minmax', 'percentile_minmax')):
+                # Min-max is shift invariant, so subtract each instance's minimum exactly in
+                # the integer domain before going to float. Casting int64/uint64 first would
+                # merge distinct values within a float64 ulp (2**64-2 and 2**64-1 both become
+                # 2**64), collapse the range to the epsilon and map the instance to 0.
+                data_slice = _subtract_instance_min_exact(data_slice, work_dtype)
+                if self.verbose: print(f"  Shifted {original_dtype} by its instance minimum and cast to {np.dtype(work_dtype).name}.")
             else:
                 # If integer or other, convert to float32
                 data_slice = data_slice.astype(work_dtype)
@@ -1062,6 +1092,12 @@ class Volume:
             for c in range(data_slice.shape[0]):
                 min_val = np.min(data_slice[c])
                 max_val = np.max(data_slice[c])
+                if np.isfinite(min_val) and np.isfinite(max_val) and not np.isfinite(max_val - min_val):
+                    # Finite range wider than the float type (e.g. [-1e308, 1e308]): halve
+                    # first so neither the range nor x - min overflows to inf.
+                    half = data_slice.dtype.type(0.5)
+                    data_slice[c] = (data_slice[c] * half - min_val * half) / (max_val * half - min_val * half)
+                    continue
                 denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
                 data_slice[c] = (data_slice[c] - min_val) / denominator
             if self.verbose: print(f"  Applied instance Min-Max scaling to [0, 1].")
@@ -1070,7 +1106,11 @@ class Volume:
             for c in range(data_slice.shape[0]):
                 lower, upper = np.percentile(data_slice[c], (1.0, 99.0))
                 denominator = float(upper - lower)
-                if denominator <= 1e-8:
+                if np.isfinite(lower) and np.isfinite(upper) and not np.isfinite(denominator):
+                    half = data_slice.dtype.type(0.5)  # finite but overflowing range, see instance_minmax
+                    clipped = np.clip(data_slice[c], lower, upper)
+                    data_slice[c] = (clipped * half - lower * half) / (upper * half - lower * half)
+                elif denominator <= 1e-8:
                     data_slice[c] = 0.0
                 else:
                     clipped = np.clip(data_slice[c], lower, upper)
