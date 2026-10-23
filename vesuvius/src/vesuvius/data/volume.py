@@ -219,6 +219,23 @@ def _fill_nonfinite(res, x, low, high):
     return res
 
 
+def _stable_percentiles(values, q=(1.0, 99.0)):
+    """np.percentile, but finite and ordered for wide finite ranges.
+
+    np.percentile interpolates as a + (b - a) * t, and b - a overflows for opposite
+    extremes: np.percentile([-1e308, 1e308], (1, 99)) gives [inf, -inf]. Values are
+    halved and the result doubled only in that case, so ordinary input is unchanged.
+    """
+    with np.errstate(over='ignore', invalid='ignore'):
+        lower, upper = np.percentile(values, q)
+    if not (np.isfinite(lower) and np.isfinite(upper) and lower <= upper):
+        half = np.asarray(values).dtype.type(0.5)
+        lo2, hi2 = np.percentile(np.asarray(values) * half, q)
+        lower, upper = lo2 * 2, hi2 * 2
+    assert np.isfinite(lower) and np.isfinite(upper) and lower <= upper, (lower, upper)
+    return lower, upper
+
+
 class Volume:
     """
     A class to represent a 3D volume in a scroll or segment.
@@ -1118,7 +1135,15 @@ class Volume:
             if np.issubdtype(data_slice.dtype, np.floating):
                 # If already float, ensure it's float32 for consistency
                 if data_slice.dtype != work_dtype:
-                    data_slice = data_slice.astype(work_dtype)
+                    with np.errstate(over='ignore'):
+                        cast = data_slice.astype(work_dtype)
+                    # Keep the wider float if narrowing would overflow finite values to
+                    # +-inf (float64 1e308 -> float32 inf): they must stay finite data.
+                    if (np.dtype(work_dtype).itemsize < data_slice.dtype.itemsize
+                            and not np.isfinite(cast).all()
+                            and np.count_nonzero(np.isfinite(data_slice)) > np.count_nonzero(np.isfinite(cast))):
+                        cast = data_slice
+                    data_slice = cast
                     if self.verbose: print(f"  Cast existing float ({original_dtype}) to {np.dtype(work_dtype).name} for normalization.")
             elif (np.issubdtype(data_slice.dtype, np.integer)
                     and self.normalization_scheme in ('instance_minmax', 'percentile_minmax')):
@@ -1229,11 +1254,12 @@ class Volume:
                 if fin is not None:
                     # clip below maps +inf/-inf to the finite percentiles; NaN -> 0 after
                     x_orig = np.array(data_slice[c], copy=True)
-                    lower, upper = np.percentile(x_orig[fin], (1.0, 99.0))
+                    lower, upper = _stable_percentiles(x_orig[fin])
                     data_slice[c] = np.nan_to_num(x_orig, nan=lower, posinf=upper, neginf=lower)
                 else:
-                    lower, upper = np.percentile(data_slice[c], (1.0, 99.0))
-                denominator = float(upper - lower)
+                    lower, upper = _stable_percentiles(data_slice[c])
+                with np.errstate(over='ignore'):
+                    denominator = float(upper - lower)
                 if np.isfinite(lower) and np.isfinite(upper) and not np.isfinite(denominator):
                     half = data_slice.dtype.type(0.5)  # finite but overflowing range, see instance_minmax
                     clipped = np.clip(data_slice[c], lower, upper)

@@ -367,3 +367,31 @@ def test_instance_minmax_exact_64bit_target_interior(tmp_path, fmt, tgt):
     out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type=f"np.{tgt}")
     top = int(np.iinfo(tgt).max)
     assert [int(v) for v in out] == [0, round(Fraction(top, 3)), top]
+
+
+# REDTEAM-022: np.percentile([-1e308, 1e308], (1, 99)) overflows to [inf, -inf], which
+# sent percentile_minmax to the all-zero branch. Real zarr2 Volume, shape (1, 1, n).
+@pytest.mark.parametrize("vals,dtype,want", [
+    ([-1e308, 1e308], np.float64, [0, 1]),
+    ([-3e38, 3e38], np.float32, [0, 1]),
+    ([-3e38, 3e38, math.inf], np.float32, [0, 1, 1]),
+    ([-1e308, 1e308, math.inf], np.float64, [0, 1, 1]),
+])
+@pytest.mark.parametrize("rt", [None, "np.float32", "np.float64"])
+def test_percentile_minmax_opposite_extremes(tmp_path, vals, dtype, want, rt):
+    kw = dict(normalization_scheme="percentile_minmax")
+    if rt:
+        kw["return_as_type"] = rt
+    data = np.array(vals, dtype).reshape(1, 1, -1)
+    out = _read(tmp_path, data, 2, **kw)
+    np.testing.assert_allclose(out.astype(np.float64), want, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("scheme", ["instance_minmax", "percentile_minmax"])
+@pytest.mark.parametrize("rt,top", [("np.uint64", 2**64 - 1), ("np.int64", 2**63 - 1),
+                                    ("np.uint8", 255)])
+def test_bool_source_to_integer_targets(tmp_path, scheme, rt, top):
+    data = np.array([True, False, True], bool).reshape(1, 1, -1)
+    out = _read(tmp_path, data, 2, normalization_scheme=scheme, return_as_type=rt)
+    assert out.dtype == np.dtype(rt.replace("np.", ""))
+    assert out.tolist() == [top, 0, top]
