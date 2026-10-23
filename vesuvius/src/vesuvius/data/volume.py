@@ -245,7 +245,10 @@ def _zscore_stats(v):
 def _zscore(x, mean, std, scale):
     if scale is None:
         return (x - mean) / max(std, 1e-8)
-    return (x / scale - mean) / max(std, 1e-8 / scale)
+    # Divide in float64: the std floor 1e-8 / scale (3e-47 for scale 3e38) underflows
+    # to 0 in float32 and would turn a constant instance into 0/0 = NaN.
+    z = (np.asarray(x / scale, np.float64) - float(mean)) / max(float(std), 1e-8 / float(scale))
+    return z.astype(np.asarray(x).dtype, copy=False)
 
 
 def _widen_if_overflow(res, src, fn):

@@ -460,3 +460,22 @@ def test_percentile_minmax_rejects_bad_percentiles(tmp_path, fmt, monkeypatch):
     data = np.array([0.0, 1.0, 2.0], np.float32).reshape(1, 1, -1)
     with pytest.raises(ValueError, match="not finite and ordered"):
         _read(tmp_path, data, fmt, normalization_scheme="percentile_minmax")
+
+
+# FOUND C: finite_only z-score where the finite part needs scaling ([3e38, 3e38] overflows
+# the float32 mean) and is constant: no NaN from the finite z min/max.
+@pytest.mark.parametrize("bad,want_bad", [(math.inf, 0.0), (math.nan, 0.0), (-math.inf, 0.0)])
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_instance_zscore_scaled_constant_with_nonfinite(tmp_path, fmt, bad, want_bad):
+    data = np.array([3e38, 3e38, bad], np.float32).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_zscore").ravel()
+    assert np.all(np.isfinite(out))
+    np.testing.assert_array_equal(out, [0, 0, want_bad])
+
+
+# FOUND B: float32 [-1e20, 1e20]: the float32 variance (1e40) overflows.
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_instance_zscore_float32_variance_overflow(tmp_path, fmt):
+    data = np.array([-1e20, 1e20], np.float32).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_zscore").ravel()
+    np.testing.assert_allclose(out, [-1, 1], rtol=0, atol=1e-6)
