@@ -255,14 +255,27 @@ def _zscore(x, mean, std, scale):
     return z.astype(np.asarray(x).dtype, copy=False)
 
 
-def _widen_if_overflow(res, src, fn):
-    """Return fn(src as float64) if the float32 result res has non-finite values where
-    src was finite (e.g. global_zscore 3e38 - (-1e38)); otherwise res unchanged."""
-    if res.dtype != np.float32 or np.isfinite(res).all():
+def _widen_if_overflow(res, src, fn, stable):
+    """Fix voxels where the result overflowed although the input was finite.
+
+    1. A float32 result is recomputed as fn(src as float64) (e.g. global_zscore
+       3e38 - (-1e38)), as before.
+    2. Voxels still non-finite (x - mean overflows even in float64, e.g. 1e308 -
+       (-1e308)) are recomputed with ``stable`` (((x/2 - mean/2) / std) * 2: halving is
+       exact, a true overflow still gives inf); the others keep
+       the plain result, so ordinary data is unchanged.
+    """
+    if np.isfinite(res).all():
         return res
-    if np.count_nonzero(np.isfinite(res)) >= np.count_nonzero(np.isfinite(src)):
-        return res
-    return fn(src.astype(np.float64))
+    if (res.dtype == np.float32
+            and np.count_nonzero(np.isfinite(res)) < np.count_nonzero(np.isfinite(src))):
+        src = src.astype(np.float64)
+        res = fn(src)
+    bad = ~np.isfinite(res) & np.isfinite(src)
+    if bad.any():
+        res = np.array(res, copy=True)
+        res[bad] = np.asarray(stable(src[bad]), dtype=res.dtype)
+    return res
 
 
 def _stable_percentiles(values, q=(1.0, 99.0)):
@@ -1269,9 +1282,11 @@ class Volume:
             if self.global_mean is None or self.global_std is None:
                 raise ValueError(
                     "Internal Error: global_mean/std missing for global_zscore.")  # Should be caught in init
-            gz = lambda a: (a - self.global_mean) / max(self.global_std, 1e-8)
-            with np.errstate(over='ignore'):
-                data_slice = _widen_if_overflow(gz(data_slice), data_slice, gz)
+            gs = max(self.global_std, 1e-8)
+            gz = lambda a: (a - self.global_mean) / gs
+            gz_stable = lambda a: ((a * 0.5 - self.global_mean * 0.5) / gs) * 2  # x - mean overflows; halving is exact
+            with np.errstate(over='ignore', invalid='ignore'):
+                data_slice = _widen_if_overflow(gz(data_slice), data_slice, gz, gz_stable)
             if self.verbose: print(
                 f"  Applied global Z-score (mean={self.global_mean:.4f}, std={self.global_std:.4f}).")
 
@@ -1349,9 +1364,11 @@ class Volume:
             mean = float(self.intensity_props['mean'])
             std = float(self.intensity_props['std'])
             # Clip in-place per channel
-            ctz = lambda a: (np.clip(a, lb, ub) - mean) / max(std, 1e-8)
-            with np.errstate(over='ignore'):
-                data_slice = _widen_if_overflow(ctz(data_slice), data_slice, ctz)
+            cs = max(std, 1e-8)
+            ctz = lambda a: (np.clip(a, lb, ub) - mean) / cs
+            ctz_stable = lambda a: ((np.clip(a, lb, ub) * 0.5 - mean * 0.5) / cs) * 2  # x - mean overflows; halving is exact
+            with np.errstate(over='ignore', invalid='ignore'):
+                data_slice = _widen_if_overflow(ctz(data_slice), data_slice, ctz, ctz_stable)
             if self.verbose: print(
                 f"  Applied CT normalization (clip to [{lb:.4f}, {ub:.4f}], mean={mean:.4f}, std={std:.4f}).")
 

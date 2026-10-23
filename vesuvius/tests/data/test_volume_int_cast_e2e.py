@@ -514,3 +514,16 @@ def test_read_does_not_mutate_source(tmp_path, backing, src, scheme, rt):
     np.testing.assert_array_equal(second, first)
     np.testing.assert_array_equal(keep, keep_copy)  # an earlier raw read is untouched
     np.testing.assert_array_equal(data, ref)
+
+
+# REDTEAM-023: x - mean overflows even in float64 (1e308 - (-1e308)); the representable
+# result (1e308 + 1e308) / 1e308 = 2 must come back finite.
+@pytest.mark.parametrize("scheme", ["global_zscore", "ct"])
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_representable_float64_normalization(tmp_path, fmt, scheme):
+    data = np.full((1, 1, 1), 1e308, np.float64)
+    kw = ({"global_mean": -1e308, "global_std": 1e308} if scheme == "global_zscore" else
+          {"intensity_props": {"mean": -1e308, "std": 1e308,
+                               "percentile_00_5": -1e308, "percentile_99_5": 1e308}})
+    out = _read(tmp_path, data, fmt, normalization_scheme=scheme, return_as_type="np.float64", **kw)
+    np.testing.assert_allclose(out, [2.0])
