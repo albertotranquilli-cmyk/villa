@@ -1283,7 +1283,10 @@ class Volume:
                 raise ValueError(
                     "Internal Error: global_mean/std missing for global_zscore.")  # Should be caught in init
             gs = max(self.global_std, 1e-8)
-            gz = lambda a: (a - self.global_mean) / gs
+            def gz(a):
+                # Same arithmetic as (a - mean) / gs, in place on the subtraction temporary.
+                t = np.subtract(a, self.global_mean)
+                return np.divide(t, gs, out=t)
             gz_stable = lambda a: ((a * 0.5 - self.global_mean * 0.5) / gs) * 2  # x - mean overflows; halving is exact
             with np.errstate(over='ignore', invalid='ignore'):
                 data_slice = _widen_if_overflow(gz(data_slice), data_slice, gz, gz_stable)
@@ -1365,7 +1368,10 @@ class Volume:
             std = float(self.intensity_props['std'])
             # Clip in-place per channel
             cs = max(std, 1e-8)
-            ctz = lambda a: (np.clip(a, lb, ub) - mean) / cs
+            def ctz(a):
+                # Same arithmetic as (clip(a) - mean) / cs, in place on the clip temporary.
+                t = np.clip(a, lb, ub)
+                return np.divide(np.subtract(t, mean, out=t), cs, out=t)
             ctz_stable = lambda a: ((np.clip(a, lb, ub) * 0.5 - mean * 0.5) / cs) * 2  # x - mean overflows; halving is exact
             with np.errstate(over='ignore', invalid='ignore'):
                 data_slice = _widen_if_overflow(ctz(data_slice), data_slice, ctz, ctz_stable)
