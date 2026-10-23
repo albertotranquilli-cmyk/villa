@@ -1146,6 +1146,11 @@ class Volume:
                 store = self._level(subvolume_idx)
 
             data_slice = self._read_with_retry(store, coord_idx)
+            # zarr returns a fresh array; a numpy-backed level returns a VIEW of the
+            # caller's array, and normalization below writes in place. Copy only then.
+            if (self.normalization_scheme != 'none' and isinstance(data_slice, np.ndarray)
+                    and not isinstance(store, zarr.Array) and np.may_share_memory(data_slice, store)):
+                data_slice = data_slice.copy()
 
             original_dtype = data_slice.dtype
 
