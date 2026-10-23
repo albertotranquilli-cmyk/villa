@@ -97,12 +97,20 @@ Image.MAX_IMAGE_PIXELS = None
 def _float_to_int_saturate(arr, target_dtype):
     """Round float data to ``target_dtype`` with saturation instead of wrapping.
 
-    Computed in float64 (float32 cannot represent 2**31-1 or 2**32-1, so clipping
-    in float32 rounds the bound up and the cast wraps). Policy: NaN -> 0,
-    +inf -> target max, -inf -> target min, finite values are rounded half to
-    even and clipped to the target range.
+    Policy: NaN -> 0, +inf -> target max, -inf -> target min, finite values are
+    rounded half to even and clipped to the target range.
     """
     tinfo = np.iinfo(target_dtype)
+    arr = np.asarray(arr)
+    if tinfo.bits < 64:
+        # The bounds must be exact in the working float type: float32 holds every
+        # 8/16-bit bound, float64 the 32-bit ones (float32 cannot hold 2**31-1 or
+        # 2**32-1, so clipping there would round the bound up and the cast wrap).
+        work = np.float32 if (tinfo.bits <= 16 and arr.dtype in (np.float16, np.float32)) else np.float64
+        a = np.clip(arr.astype(work, copy=True), tinfo.min, tinfo.max)  # NaN passes through
+        np.rint(a, out=a)  # integer bounds stay in range
+        np.nan_to_num(a, copy=False, nan=0.0)
+        return a.astype(target_dtype)
     a = np.rint(np.asarray(arr, dtype=np.float64))
     # Saturate in the integer domain: float64 cannot represent int64/uint64 max
     # (float(max) rounds up to 2**63 / 2**64), so clipping in float then casting
@@ -1007,8 +1015,11 @@ class Volume:
         # The output dtype is the integer target either way, so this is not observable
         # other than through the corrected values.
         work_dtype = np.float32
+        int_target = self._integer_return_dtype()
         if (self.normalization_scheme in ('instance_minmax', 'percentile_minmax')
-                and self._integer_return_dtype() is not None):
+                and int_target is not None
+                and (np.iinfo(int_target).bits >= 32
+                     or not np.can_cast(data_slice.dtype, np.float32, casting='safe'))):
             work_dtype = np.float64
         if self.normalization_scheme != 'none':
             if np.issubdtype(data_slice.dtype, np.floating):
@@ -1100,8 +1111,10 @@ class Volume:
                     if self.normalization_scheme in ['instance_minmax', 'percentile_minmax']:  # Data is in [0, 1] range
                         max_target_val = get_max_value(target_dtype)
                         # Scale to target range, clip just in case due to float precision
+                        # data_slice is float64 for >=32-bit targets (see step 1); float32
+                        # holds the 8/16-bit maxima exactly, so scale in the working dtype.
                         data_slice = _float_to_int_saturate(
-                            np.asarray(data_slice, dtype=np.float64) * max_target_val, target_dtype)
+                            data_slice * data_slice.dtype.type(max_target_val), target_dtype)
                         final_dtype = target_dtype
                         if self.verbose: print(f"  Scaled [0,1] data to target integer {target_dtype_str}.")
                     elif self.normalization_scheme in ['instance_zscore', 'global_zscore']:
