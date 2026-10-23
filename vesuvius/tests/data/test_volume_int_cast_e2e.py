@@ -395,3 +395,58 @@ def test_bool_source_to_integer_targets(tmp_path, scheme, rt, top):
     out = _read(tmp_path, data, 2, normalization_scheme=scheme, return_as_type=rt)
     assert out.dtype == np.dtype(rt.replace("np.", ""))
     assert out.tolist() == [top, 0, top]
+
+
+# Overflow in z-score statistics and in float64 -> float32 work casts (real Volume).
+_S2 = math.sqrt(2)
+
+
+@pytest.mark.parametrize("vals,dtype,want", [
+    ([-3e38, 3e38], np.float32, [-1, 1]),
+    ([3e38, 3e38, 0], np.float32, [1 / _S2, 1 / _S2, -_S2]),
+    ([-1e308, 1e308], np.float64, [-1, 1]),
+    ([-1e200, 1e200], np.float64, [-1, 1]),
+    ([1e308, 1e308], np.float64, [0, 0]),
+    ([-3e38, 3e38, math.inf], np.float32, [-1, 1, 1]),
+])
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_instance_zscore_no_overflow(tmp_path, fmt, vals, dtype, want):
+    data = np.array(vals, dtype).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_zscore")
+    assert np.all(np.isfinite(out))
+    np.testing.assert_allclose(out.astype(np.float64).ravel(), want, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("vals,want", [
+    ([0, 1e300, 5e299], [0, 1, 0.5]),
+    ([-1e308, 1e308, 0], [0, 1, 0.5]),
+])
+@pytest.mark.parametrize("scheme", ["instance_minmax", "percentile_minmax"])
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_float64_cast_overflow_keeps_float64_work(tmp_path, fmt, vals, want, scheme):
+    data = np.array(vals, np.float64).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme=scheme)
+    want = want if scheme == "instance_minmax" else [0, 1, 0.5]
+    np.testing.assert_allclose(out.astype(np.float64).ravel(), want, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_float64_cast_underflow_keeps_float64_work(tmp_path, fmt):
+    # 1e-300 flushes to 0 in float32, merging distinct values. The work stays float64;
+    # the result is still tiny because the existing 1e-8 range/std floor applies.
+    data = np.array([1e-300, 2e-300, 3e-300], np.float64).reshape(1, 1, -1)
+    for scheme in ("instance_minmax", "instance_zscore"):
+        out = _read(tmp_path / scheme, data, fmt, normalization_scheme=scheme).ravel()
+        assert out.dtype == np.float64
+        assert out[0] < out[1] < out[2]
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_global_zscore_and_ct_no_overflow(tmp_path, fmt):
+    data = np.array([3e38, -3e38], np.float32).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="global_zscore",
+                global_mean=-1e38, global_std=1.0)
+    np.testing.assert_allclose(out.astype(np.float64).ravel(), [4e38, -2e38], rtol=1e-6)
+    out = _read(tmp_path / "ct", data, fmt, normalization_scheme="ct", intensity_props={
+        "mean": -1e38, "std": 1.0, "percentile_00_5": -3e38, "percentile_99_5": 3e38})
+    np.testing.assert_allclose(out.astype(np.float64).ravel(), [4e38, -2e38], rtol=1e-6)

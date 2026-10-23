@@ -219,6 +219,45 @@ def _fill_nonfinite(res, x, low, high):
     return res
 
 
+def _narrowing_loses_range(src, cast):
+    """True if casting float src to the narrower float cast overflowed a finite value
+    to +-inf, or flushed a non-zero value below the narrow type's normal range
+    (float64 1e-300 -> float32 0), which would distort any normalisation."""
+    if not np.isfinite(cast).all() and np.count_nonzero(np.isfinite(src)) > np.count_nonzero(np.isfinite(cast)):
+        return True
+    with np.errstate(invalid='ignore'):
+        nz = np.abs(src[(src != 0) & np.isfinite(src)])
+    return nz.size > 0 and nz.min() < np.finfo(cast.dtype).tiny
+
+
+def _zscore_stats(v):
+    """mean and std of v (all finite). If either overflows, compute them on v / max|v|
+    and return (mean, std, scale) in that scaled unit; else scale is None."""
+    with np.errstate(over='ignore', invalid='ignore'):
+        mean, std = np.mean(v), np.std(v)
+    if np.isfinite(mean) and np.isfinite(std):
+        return mean, std, None
+    scale = np.abs(v).max()
+    w = v / scale
+    return np.mean(w), np.std(w), scale
+
+
+def _zscore(x, mean, std, scale):
+    if scale is None:
+        return (x - mean) / max(std, 1e-8)
+    return (x / scale - mean) / max(std, 1e-8 / scale)
+
+
+def _widen_if_overflow(res, src, fn):
+    """Return fn(src as float64) if the float32 result res has non-finite values where
+    src was finite (e.g. global_zscore 3e38 - (-1e38)); otherwise res unchanged."""
+    if res.dtype != np.float32 or np.isfinite(res).all():
+        return res
+    if np.count_nonzero(np.isfinite(res)) >= np.count_nonzero(np.isfinite(src)):
+        return res
+    return fn(src.astype(np.float64))
+
+
 def _stable_percentiles(values, q=(1.0, 99.0)):
     """np.percentile, but finite and ordered for wide finite ranges.
 
@@ -1140,8 +1179,7 @@ class Volume:
                     # Keep the wider float if narrowing would overflow finite values to
                     # +-inf (float64 1e308 -> float32 inf): they must stay finite data.
                     if (np.dtype(work_dtype).itemsize < data_slice.dtype.itemsize
-                            and not np.isfinite(cast).all()
-                            and np.count_nonzero(np.isfinite(data_slice)) > np.count_nonzero(np.isfinite(cast))):
+                            and _narrowing_loses_range(data_slice, cast)):
                         cast = data_slice
                     data_slice = cast
                     if self.verbose: print(f"  Cast existing float ({original_dtype}) to {np.dtype(work_dtype).name} for normalization.")
@@ -1185,19 +1223,16 @@ class Volume:
                 x = data_slice[c]
                 fin = _nonfinite_mask(x)
                 if fin is None:
-                    mean = np.mean(x)
-                    std = np.std(x)
                     # Epsilon prevents division by zero or near-zero std dev
-                    data_slice[c] = (x - mean) / max(std, 1e-8)
+                    data_slice[c] = _zscore(x, *_zscore_stats(x))
                     continue
                 if not fin.any():
                     data_slice[c] = 0.0
                     all_nonfinite_instances += 1
                     continue
-                mean = np.mean(x[fin])
-                std = np.std(x[fin])
+                stats = _zscore_stats(x[fin])
                 with np.errstate(invalid='ignore', over='ignore'):
-                    z = np.asarray((x - mean) / max(std, 1e-8))
+                    z = np.asarray(_zscore(x, *stats))
                 zf = z[fin]
                 z = _fill_nonfinite(z, x, low=zf.min(), high=zf.max())
                 data_slice[c] = z
@@ -1208,7 +1243,9 @@ class Volume:
             if self.global_mean is None or self.global_std is None:
                 raise ValueError(
                     "Internal Error: global_mean/std missing for global_zscore.")  # Should be caught in init
-            data_slice = (data_slice - self.global_mean) / max(self.global_std, 1e-8)
+            gz = lambda a: (a - self.global_mean) / max(self.global_std, 1e-8)
+            with np.errstate(over='ignore'):
+                data_slice = _widen_if_overflow(gz(data_slice), data_slice, gz)
             if self.verbose: print(
                 f"  Applied global Z-score (mean={self.global_mean:.4f}, std={self.global_std:.4f}).")
 
@@ -1280,8 +1317,9 @@ class Volume:
             mean = float(self.intensity_props['mean'])
             std = float(self.intensity_props['std'])
             # Clip in-place per channel
-            data_slice = np.clip(data_slice, lb, ub)
-            data_slice = (data_slice - mean) / max(std, 1e-8)
+            ctz = lambda a: (np.clip(a, lb, ub) - mean) / max(std, 1e-8)
+            with np.errstate(over='ignore'):
+                data_slice = _widen_if_overflow(ctz(data_slice), data_slice, ctz)
             if self.verbose: print(
                 f"  Applied CT normalization (clip to [{lb:.4f}, {ub:.4f}], mean={mean:.4f}, std={std:.4f}).")
 
