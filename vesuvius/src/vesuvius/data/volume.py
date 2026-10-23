@@ -93,6 +93,40 @@ from .utils import get_max_value, open_zarr
 Image.MAX_IMAGE_PIXELS = None
 
 
+
+def _float_to_int_saturate(arr, target_dtype):
+    """Round float data to ``target_dtype`` with saturation instead of wrapping.
+
+    Policy: NaN -> 0, +inf -> target max, -inf -> target min, finite values are
+    rounded half to even and clipped to the target range.
+    """
+    tinfo = np.iinfo(target_dtype)
+    arr = np.asarray(arr)
+    if tinfo.bits < 64:
+        # The bounds must be exact in the working float type: float32 holds every
+        # 8/16-bit bound, float64 the 32-bit ones (float32 cannot hold 2**31-1 or
+        # 2**32-1, so clipping there would round the bound up and the cast wrap).
+        work = np.float32 if (tinfo.bits <= 16 and arr.dtype in (np.float16, np.float32)) else np.float64
+        a = np.clip(arr.astype(work, copy=True), tinfo.min, tinfo.max)  # NaN passes through
+        np.rint(a, out=a)  # integer bounds stay in range
+        np.nan_to_num(a, copy=False, nan=0.0)
+        return a.astype(target_dtype)
+    a = np.rint(np.asarray(arr, dtype=np.float64))
+    # Saturate in the integer domain: float64 cannot represent int64/uint64 max
+    # (float(max) rounds up to 2**63 / 2**64), so clipping in float then casting
+    # would overflow. Both bounds below are exact powers of two (or zero).
+    upper = 2.0 ** (tinfo.bits - 1 if tinfo.min < 0 else tinfo.bits)  # == max + 1
+    lower = float(tinfo.min)
+    hi = a >= upper  # includes +inf
+    lo = a < lower   # includes -inf
+    nan = np.isnan(a)
+    interior = ~(hi | lo | nan)
+    out = np.zeros(a.shape, dtype=target_dtype)
+    out[interior] = a[interior].astype(target_dtype)
+    out[hi] = tinfo.max
+    out[lo] = tinfo.min
+    return out
+
 class Volume:
     """
     A class to represent a 3D volume in a scroll or segment.
@@ -848,6 +882,16 @@ class Volume:
                 time.sleep(delay)
                 delay = min(delay * 2, 8.0)
 
+    def _integer_return_dtype(self):
+        """The integer dtype named by ``return_as_type``, or None."""
+        if self.return_as_type == 'none':
+            return None
+        try:
+            dt = np.dtype(getattr(np, self.return_as_type.replace('np.', '')))
+        except (AttributeError, TypeError):
+            return None
+        return dt if np.issubdtype(dt, np.integer) else None
+
     def __getitem__(self, idx: Union[Tuple[Union[int, slice], ...], int]) -> Union[NDArray, torch.Tensor]:
         """
         Gets a sub-volume or slice, applying specified normalization and type conversion.
@@ -964,16 +1008,29 @@ class Volume:
         # --- Preprocessing Steps ---
 
         # 1. Convert to float32 for normalization calculations (if needed)
+        # Min-max output that is rescaled to an integer return_as_type is computed in
+        # float64: float32 has a 24-bit mantissa, so it cannot hold int32/uint32 inputs
+        # exactly (uint32 2**32-2 -> 2**32, saturating to the max) and quantizes the
+        # [0, 1] value too coarsely for 32/64-bit targets (errors of up to 2**39 units).
+        # The output dtype is the integer target either way, so this is not observable
+        # other than through the corrected values.
+        work_dtype = np.float32
+        int_target = self._integer_return_dtype()
+        if (self.normalization_scheme in ('instance_minmax', 'percentile_minmax')
+                and int_target is not None
+                and (np.iinfo(int_target).bits >= 32
+                     or not np.can_cast(data_slice.dtype, np.float32, casting='safe'))):
+            work_dtype = np.float64
         if self.normalization_scheme != 'none':
             if np.issubdtype(data_slice.dtype, np.floating):
                 # If already float, ensure it's float32 for consistency
-                if data_slice.dtype != np.float32:
-                    data_slice = data_slice.astype(np.float32)
-                    if self.verbose: print(f"  Cast existing float ({original_dtype}) to np.float32 for normalization.")
+                if data_slice.dtype != work_dtype:
+                    data_slice = data_slice.astype(work_dtype)
+                    if self.verbose: print(f"  Cast existing float ({original_dtype}) to {np.dtype(work_dtype).name} for normalization.")
             else:
                 # If integer or other, convert to float32
-                data_slice = data_slice.astype(np.float32)
-                if self.verbose: print(f"  Cast {original_dtype} to np.float32 for normalization.")
+                data_slice = data_slice.astype(work_dtype)
+                if self.verbose: print(f"  Cast {original_dtype} to {np.dtype(work_dtype).name} for normalization.")
 
         # 2. Apply Normalization Scheme
         # Handle potential channel dimension (assume channels are dim 0 if present)
@@ -1054,7 +1111,10 @@ class Volume:
                     if self.normalization_scheme in ['instance_minmax', 'percentile_minmax']:  # Data is in [0, 1] range
                         max_target_val = get_max_value(target_dtype)
                         # Scale to target range, clip just in case due to float precision
-                        data_slice = np.clip(data_slice * max_target_val, 0, max_target_val)
+                        # data_slice is float64 for >=32-bit targets (see step 1); float32
+                        # holds the 8/16-bit maxima exactly, so scale in the working dtype.
+                        data_slice = _float_to_int_saturate(
+                            data_slice * data_slice.dtype.type(max_target_val), target_dtype)
                         final_dtype = target_dtype
                         if self.verbose: print(f"  Scaled [0,1] data to target integer {target_dtype_str}.")
                     elif self.normalization_scheme in ['instance_zscore', 'global_zscore']:
@@ -1064,7 +1124,20 @@ class Volume:
                               f"Output remains {final_dtype} to avoid data loss. Adjust 'return_as_type' or normalization scheme if needed.")
                         # final_dtype remains float32
                     else:  # Normalization was 'none'
-                        # Allow direct casting if no normalization occurred
+                        # A plain astype wraps out-of-range integers (uint16 65535 -> uint8 255,
+                        # 256 -> 0). Narrowing unsigned -> unsigned rescales by the dtype ranges
+                        # (uint16 -> uint8 is v >> 8); anything else is clipped to the target range.
+                        src_dtype = data_slice.dtype
+                        tinfo = np.iinfo(target_dtype)
+                        if (np.issubdtype(src_dtype, np.unsignedinteger)
+                                and np.issubdtype(target_dtype, np.unsignedinteger)
+                                and np.iinfo(src_dtype).max > tinfo.max):
+                            shift = np.iinfo(src_dtype).bits - tinfo.bits
+                            data_slice = data_slice >> shift
+                        elif np.issubdtype(src_dtype, np.floating):
+                            data_slice = _float_to_int_saturate(data_slice, target_dtype)
+                        elif np.issubdtype(src_dtype, np.integer) and not np.can_cast(src_dtype, target_dtype):
+                            data_slice = np.clip(data_slice, tinfo.min, tinfo.max)
                         final_dtype = target_dtype
                         if self.verbose: print(f"  Casting non-normalized data to target integer {target_dtype_str}.")
 
