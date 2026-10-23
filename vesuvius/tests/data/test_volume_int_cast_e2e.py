@@ -127,7 +127,9 @@ def test_instance_minmax_int_target(tmp_path, fmt, src, tgt):
     for x, got in zip(xs, out):
         exact = _round_half_even((x - lo) / (hi - lo) * ti.max)
         assert 0 <= int(got) <= ti.max
-        assert abs(int(got) - exact) <= _minmax_tolerance(tgt, exact), (x, int(got), exact)
+        # integer sources are scaled with exact integer arithmetic
+        tol = 0 if vals.dtype.kind in "iu" else _minmax_tolerance(tgt, exact)
+        assert abs(int(got) - exact) <= tol, (x, int(got), exact)
     assert int(out[int(np.argmin(xs))]) == 0
     assert int(out[int(np.argmax(xs))]) == ti.max
 
@@ -184,3 +186,137 @@ def test_percentile_minmax_int_target_in_range(tmp_path, fmt, tgt):
     assert out.dtype == np.dtype(tgt)
     assert int(out[0]) == 0 and int(out[-1]) == ti.max
     assert np.all(np.diff(out.astype(np.float64)) >= 0)
+
+
+# --- REDTEAM-020: 64-bit integer inputs must not collapse before min/max ---
+_U64MAX, _I64MIN, _I64MAX = 2**64 - 1, -2**63, 2**63 - 1
+
+
+def _minmax_oracle(vals, tgt):
+    xs = [Fraction(v) for v in vals]
+    lo, hi = min(xs), max(xs)
+    m = np.iinfo(tgt).max
+    return [0 if hi == lo else round((x - lo) / (hi - lo) * m) for x in xs]
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("tgt", ["uint8", "uint32", "uint64"])
+@pytest.mark.parametrize("scheme", ["instance_minmax", "percentile_minmax"])
+@pytest.mark.parametrize("src,vals", [
+    ("uint64", [_U64MAX - 1, _U64MAX]),
+    ("uint64", [_U64MAX - 2, _U64MAX - 1, _U64MAX]),
+    ("uint64", [0, 1, 2]),
+    ("int64", [_I64MAX - 1, _I64MAX]),
+    ("int64", [_I64MIN, _I64MIN + 1, _I64MIN + 2]),
+    ("int64", [_I64MIN, -1, 0, _I64MAX]),
+    ("uint64", [0, 2**63, _U64MAX]),
+])
+def test_minmax_64bit_close_values_keep_contrast(tmp_path, fmt, tgt, scheme, src, vals):
+    data = np.array(vals, dtype=src).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme=scheme, return_as_type=f"np.{tgt}")
+    if scheme == "percentile_minmax":
+        # percentile endpoints are interpolated; endpoints and order are exact
+        assert int(out[0]) == 0 and int(out[-1]) == np.iinfo(tgt).max
+        assert np.all(np.diff(out.astype(np.float64)) >= 0)
+        return
+    assert [int(v) for v in out] == _minmax_oracle(vals, tgt)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("tgt", ["uint8", "uint64"])
+@pytest.mark.parametrize("src", ["float32", "float64"])
+def test_minmax_finite_range_wider_than_float(tmp_path, fmt, tgt, src):
+    big = float(np.finfo(src).max) / 1.5
+    data = np.array([-big, 0.0, big], dtype=src).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type=f"np.{tgt}")
+    m = np.iinfo(tgt).max
+    assert int(out[0]) == 0 and int(out[2]) == m
+    assert abs(int(out[1]) - round(Fraction(m, 2))) <= _minmax_tolerance(np.dtype(tgt), m // 2)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_minmax_multichannel_is_shifted_per_channel(tmp_path, fmt):
+    path = str(tmp_path / f"c{fmt}.zarr")
+    data = np.array([[_U64MAX - 1, _U64MAX], [0, 7]], dtype=np.uint64).reshape(2, 1, 1, 2)
+    if _ZARR_MAJOR >= 3:
+        a = zarr.open_group(path, mode="w", zarr_format=fmt).create_array(
+            name="0", shape=data.shape, chunks=data.shape, dtype=data.dtype)
+    else:
+        a = zarr.open_group(path, mode="w").zeros(name="0", shape=data.shape, chunks=data.shape, dtype=data.dtype)
+    a[...] = data
+    v = Volume(type="zarr", path=path, verbose=False, normalization_scheme="instance_minmax",
+               return_as_type="np.uint8")
+    out = v[0:2, 0:1, 0:1, 0:2]
+    np.testing.assert_array_equal(out.reshape(2, 2), [[0, 255], [0, 255]])
+
+
+# Non-finite input: policy pinned as-is (one NaN/inf voxel zeroes the instance).
+# This documents current behaviour; it is not an endorsement (REDTEAM-020 FOUND #3).
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("vals", [[0, 1, math.nan], [0, 1, math.inf], [-math.inf, 0, 1]])
+def test_minmax_nonfinite_policy_pinned(tmp_path, fmt, vals):
+    data = np.array(vals, dtype=np.float32).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type="np.uint8")
+    np.testing.assert_array_equal(out, [0, 0, 0])
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("scheme", ["instance_minmax", "percentile_minmax"])
+def test_minmax_2d_read_64bit_keeps_contrast(tmp_path, fmt, scheme):
+    # 2D read (volume[z, :, :]): whichever grouping normalization uses, the
+    # top-of-range uint64 values must keep their contrast.
+    data = np.array([[_U64MAX - 3, _U64MAX - 2, _U64MAX - 1, _U64MAX]] * 2, dtype=np.uint64).reshape(1, 2, 4)
+    path = str(tmp_path / f"d{fmt}.zarr")
+    if _ZARR_MAJOR >= 3:
+        a = zarr.open_group(path, mode="w", zarr_format=fmt).create_array(
+            name="0", shape=data.shape, chunks=data.shape, dtype=data.dtype)
+    else:
+        a = zarr.open_group(path, mode="w").zeros(name="0", shape=data.shape, chunks=data.shape, dtype=data.dtype)
+    a[...] = data
+    v = Volume(type="zarr", path=path, verbose=False, normalization_scheme=scheme, return_as_type="np.uint8")
+    out = v[0, 0:2, 0:4]
+    assert out.shape == (2, 4)
+    for row in out:
+        assert int(row[0]) == 0 and int(row[-1]) == 255
+        assert np.all(np.diff(row.astype(np.int64)) > 0)
+
+
+# Off-by-one from float64 scaling of a 64-bit span (Ing X oracle, case i64_full_mid):
+# -1 in [-2**63, 2**63-1] is 127.4999... of 255, so exact rounding gives 127, not 128.
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("tgt", INT_TGT)
+@pytest.mark.parametrize("src,vals", [
+    ("int64", [_I64MIN, -1, 0, _I64MAX]),
+    ("uint64", [0, 2**63, _U64MAX]),
+    ("uint64", [_U64MAX - 2, _U64MAX - 1, _U64MAX]),
+    ("uint64", [0, 2**53, 2**53 + 1, _U64MAX]),
+    ("int64", [_I64MIN, _I64MIN + 2**62 + 1, 3, _I64MAX - 5, _I64MAX]),
+    ("uint32", [0, 1, 2**31 - 1, 2**31, 2**32 - 2, 2**32 - 1]),
+    ("int32", [-2**31, -1, 0, 1, 2**31 - 1]),
+    ("uint16", [0, 1, 257, 32767, 32768, 65534, 65535]),
+    ("uint8", list(range(256))),
+])
+def test_instance_minmax_integer_rounding_is_exact(tmp_path, fmt, tgt, src, vals):
+    data = np.array(vals, dtype=src).reshape(1, 1, -1)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type=f"np.{tgt}")
+    assert out.dtype == np.dtype(tgt)
+    assert [int(v) for v in out] == _minmax_oracle(vals, tgt)
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_instance_minmax_int64_off_by_one_witness(tmp_path, fmt):
+    data = np.array([_I64MIN, -1, 0, _I64MAX], dtype=np.int64).reshape(1, 1, -1)
+    for tgt, want in (("uint8", [0, 127, 128, 255]), ("uint16", [0, 32767, 32768, 65535])):
+        out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type=f"np.{tgt}")
+        assert [int(v) for v in out] == want
+
+
+# REDTEAM-020 addendum: 64-bit TARGETS from ordinary uint8 data lost hundreds of
+# levels in float64 (uint64 middle off by 341, int64 by 170).
+@pytest.mark.parametrize("fmt", FORMATS)
+@pytest.mark.parametrize("tgt", ["int64", "uint64"])
+def test_instance_minmax_exact_64bit_target_interior(tmp_path, fmt, tgt):
+    data = np.array([0, 1, 3], dtype=np.uint8).reshape(1, 1, 3)
+    out = _read(tmp_path, data, fmt, normalization_scheme="instance_minmax", return_as_type=f"np.{tgt}")
+    top = int(np.iinfo(tgt).max)
+    assert [int(v) for v in out] == [0, round(Fraction(top, 3)), top]

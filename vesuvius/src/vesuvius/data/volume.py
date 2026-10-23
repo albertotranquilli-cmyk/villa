@@ -127,6 +127,80 @@ def _float_to_int_saturate(arr, target_dtype):
     out[lo] = tinfo.min
     return out
 
+def _subtract_instance_min_exact(arr, work_dtype):
+    """Return ``arr - min`` per normalization instance, computed exactly, as ``work_dtype``.
+
+    A read with more than 3 dims is shifted per channel (axis 0); any other read
+    by its overall minimum. Subtracting a constant never changes a min-max
+    result, so this is correct whichever sub-instances the normalization loop
+    then uses (e.g. per row of a 2D read, or the whole read). The difference of two
+    values of any integer dtype fits in uint64 (0 <= x - min <= 2**64 - 1), and
+    modular uint64 subtraction of the two's-complement bit patterns gives it
+    exactly, for signed and unsigned inputs alike.
+    """
+    arr = np.asarray(arr)
+    as_u64 = (arr.astype(np.int64, copy=False).view(np.uint64)
+              if np.issubdtype(arr.dtype, np.signedinteger) else arr.astype(np.uint64, copy=False))
+    out = np.empty(arr.shape, dtype=work_dtype)
+    groups = [(i,) for i in range(arr.shape[0])] if arr.ndim > 3 else [(Ellipsis,)]
+    for g in groups:
+        mn = np.min(arr[g])
+        mn_u64 = (np.array(mn, dtype=np.int64).view(np.uint64)
+                  if np.issubdtype(arr.dtype, np.signedinteger) else np.uint64(mn))
+        out[g] = (as_u64[g] - mn_u64).astype(work_dtype)
+    return out
+
+
+def _exact_round_ratio(d, span, T):
+    """round_half_even(d * T / span) for Python-int-exact inputs, element-wise (object path)."""
+    p = d.astype(object) * T
+    q = p // span
+    twice = (p - q * span) * 2
+    up = (twice > span) | ((twice == span) & (q % 2 == 1))
+    q = q + up.astype(np.int64).astype(object)
+    return np.array(q.ravel().tolist(), dtype=np.uint64).reshape(d.shape)
+
+
+def _minmax_to_int_exact(x, target_dtype):
+    """Exact ``round_half_even((x - min) * T / (max - min))`` for integer ``x``.
+
+    ``T`` is the target max. A constant instance maps to 0, like the float path.
+    * 8/16-bit input: a lookup table over [min, max] computed exactly, then one
+      gather (as fast as the float32 path it replaces).
+    * wider input (already shifted to uint64 by ``_subtract_instance_min_exact``)
+      and a <=32-bit target: float64 estimate; only elements whose estimate lies
+      within the float error bound of a .5 tie are recomputed with Python ints.
+    * 64-bit targets: Python ints throughout (float64 cannot hold the levels).
+    """
+    x = np.asarray(x)
+    T = int(np.iinfo(target_dtype).max)
+    if x.size == 0:
+        return np.zeros(x.shape, dtype=target_dtype)
+    mn, mx = int(x.min()), int(x.max())
+    span = mx - mn
+    if span == 0:
+        return np.zeros(x.shape, dtype=target_dtype)
+    if x.dtype.itemsize <= 2:
+        levels = np.arange(span + 1, dtype=np.uint64)
+        lut_vals = _exact_round_ratio(levels, span, T).astype(target_dtype)
+        u = np.dtype(f"u{x.dtype.itemsize}")
+        lut = np.zeros(1 << (8 * x.dtype.itemsize), dtype=target_dtype)
+        lut[np.arange(mn, mx + 1).astype(x.dtype).view(u)] = lut_vals
+        return lut[x.view(u)]
+    d = x.astype(np.uint64, copy=False) - np.uint64(mn)
+    if np.iinfo(target_dtype).bits >= 64:
+        return _exact_round_ratio(d, span, T).astype(target_dtype)
+    y = d.astype(np.float64) * (float(T) / float(span))
+    # |error| <= ~4 ulp(y): rounding of d, of T/span, of the product, of T and span.
+    tol = 16 * np.finfo(np.float64).eps * max(float(T), 1.0)
+    q = np.rint(y)
+    amb = np.abs(np.abs(y - np.floor(y)) - 0.5) <= tol
+    out = q.astype(np.uint64)
+    if amb.any():
+        out[amb] = _exact_round_ratio(d[amb], span, T)
+    return out.astype(target_dtype)
+
+
 class Volume:
     """
     A class to represent a 3D volume in a scroll or segment.
@@ -1016,6 +1090,7 @@ class Volume:
         # other than through the corrected values.
         work_dtype = np.float32
         int_target = self._integer_return_dtype()
+        exact_int_minmax = False
         if (self.normalization_scheme in ('instance_minmax', 'percentile_minmax')
                 and int_target is not None
                 and (np.iinfo(int_target).bits >= 32
@@ -1027,6 +1102,20 @@ class Volume:
                 if data_slice.dtype != work_dtype:
                     data_slice = data_slice.astype(work_dtype)
                     if self.verbose: print(f"  Cast existing float ({original_dtype}) to {np.dtype(work_dtype).name} for normalization.")
+            elif (np.issubdtype(data_slice.dtype, np.integer)
+                    and self.normalization_scheme in ('instance_minmax', 'percentile_minmax')):
+                # Min-max is shift invariant, so subtract each instance's minimum exactly in
+                # the integer domain before going to float. Casting int64/uint64 first would
+                # merge distinct values within a float64 ulp (2**64-2 and 2**64-1 both become
+                # 2**64), collapse the range to the epsilon and map the instance to 0.
+                exact_int_minmax = (self.normalization_scheme == 'instance_minmax' and int_target is not None)
+                # instance_minmax to an integer type is finished exactly in integer
+                # arithmetic below (float64 scaling of 64-bit spans misrounds by 1:
+                # int64 -1 in [-2**63, 2**63-1] -> uint8 128 instead of 127).
+                if not (exact_int_minmax and data_slice.dtype.itemsize <= 2):  # 8/16-bit: LUT on raw values
+                    data_slice = _subtract_instance_min_exact(
+                        data_slice, np.uint64 if exact_int_minmax else work_dtype)
+                if self.verbose: print(f"  Shifted {original_dtype} by its instance minimum and cast to {np.dtype(work_dtype).name}.")
             else:
                 # If integer or other, convert to float32
                 data_slice = data_slice.astype(work_dtype)
@@ -1058,10 +1147,23 @@ class Volume:
             if self.verbose: print(
                 f"  Applied global Z-score (mean={self.global_mean:.4f}, std={self.global_std:.4f}).")
 
+        elif self.normalization_scheme == 'instance_minmax' and exact_int_minmax:
+            out = np.empty(data_slice.shape, dtype=int_target)
+            for c in range(data_slice.shape[0]):
+                out[c] = _minmax_to_int_exact(data_slice[c], int_target)
+            data_slice = out
+            if self.verbose: print(f"  Applied exact integer instance Min-Max scaling to {int_target.name}.")
+
         elif self.normalization_scheme == 'instance_minmax':
             for c in range(data_slice.shape[0]):
                 min_val = np.min(data_slice[c])
                 max_val = np.max(data_slice[c])
+                if np.isfinite(min_val) and np.isfinite(max_val) and not np.isfinite(max_val - min_val):
+                    # Finite range wider than the float type (e.g. [-1e308, 1e308]): halve
+                    # first so neither the range nor x - min overflows to inf.
+                    half = data_slice.dtype.type(0.5)
+                    data_slice[c] = (data_slice[c] * half - min_val * half) / (max_val * half - min_val * half)
+                    continue
                 denominator = max(max_val - min_val, 1e-8)  # Epsilon for stability
                 data_slice[c] = (data_slice[c] - min_val) / denominator
             if self.verbose: print(f"  Applied instance Min-Max scaling to [0, 1].")
@@ -1070,7 +1172,11 @@ class Volume:
             for c in range(data_slice.shape[0]):
                 lower, upper = np.percentile(data_slice[c], (1.0, 99.0))
                 denominator = float(upper - lower)
-                if denominator <= 1e-8:
+                if np.isfinite(lower) and np.isfinite(upper) and not np.isfinite(denominator):
+                    half = data_slice.dtype.type(0.5)  # finite but overflowing range, see instance_minmax
+                    clipped = np.clip(data_slice[c], lower, upper)
+                    data_slice[c] = (clipped * half - lower * half) / (upper * half - lower * half)
+                elif denominator <= 1e-8:
                     data_slice[c] = 0.0
                 else:
                     clipped = np.clip(data_slice[c], lower, upper)
@@ -1108,7 +1214,9 @@ class Volume:
 
                 if np.issubdtype(target_dtype, np.integer):
                     # Handle conversion to integer types
-                    if self.normalization_scheme in ['instance_minmax', 'percentile_minmax']:  # Data is in [0, 1] range
+                    if exact_int_minmax:  # already scaled exactly to the target
+                        final_dtype = target_dtype
+                    elif self.normalization_scheme in ['instance_minmax', 'percentile_minmax']:  # Data is in [0, 1] range
                         max_target_val = get_max_value(target_dtype)
                         # Scale to target range, clip just in case due to float precision
                         # data_slice is float64 for >=32-bit targets (see step 1); float32
