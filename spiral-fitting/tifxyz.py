@@ -435,6 +435,17 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_me
     identity, never one derived from the name. ``layout_metadata`` describes
     the export layout of the supplied grid.
     """
+    # Reject malformed coordinates before creating any output files.
+    zyxs = np.asarray(zyxs, dtype=np.float32)
+    if zyxs.ndim != 3 or zyxs.shape[-1] != 3 or min(zyxs.shape[:2]) < 1:
+        raise ValueError("zyxs must have shape [rows>=1, cols>=1, 3]")
+    if not np.isfinite(zyxs).all():
+        raise ValueError("zyxs contains non-finite coordinates")
+    if not np.isfinite(step_size) or step_size <= 0:
+        raise ValueError("step_size must be finite and positive")
+    if not np.isfinite(voxel_size_um) or voxel_size_um <= 0:
+        raise ValueError("voxel_size_um must be finite and positive")
+
     path = f'{path}/{uuid}'
     os.makedirs(path, exist_ok=True)
     Image.fromarray(np.asarray(zyxs[..., 2], dtype=np.float32)).save(f'{path}/x.tif')
@@ -462,7 +473,7 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_me
     if layout_metadata is not None:
         metadata[ORIENTATION_METADATA_KEY] = layout_metadata
     with open(f'{path}/meta.json', 'w') as f:
-        json.dump(metadata, f, indent=4)
+        json.dump(metadata, f, indent=4, allow_nan=False)
     return True
 
 
