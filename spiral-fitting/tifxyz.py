@@ -446,11 +446,8 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_me
     if not np.isfinite(voxel_size_um) or voxel_size_um <= 0:
         raise ValueError("voxel_size_um must be finite and positive")
 
-    path = f'{path}/{uuid}'
-    os.makedirs(path, exist_ok=True)
-    Image.fromarray(np.asarray(zyxs[..., 2], dtype=np.float32)).save(f'{path}/x.tif')
-    Image.fromarray(np.asarray(zyxs[..., 1], dtype=np.float32)).save(f'{path}/y.tif')
-    Image.fromarray(np.asarray(zyxs[..., 0], dtype=np.float32)).save(f'{path}/z.tif')
+    # Check that the complete metadata is representable as strict JSON
+    # before creating the destination or writing any TIFF.
     valid_vertex = np.any(zyxs != -1, axis=-1)
     valid_quad = valid_vertex[:-1, :-1] & valid_vertex[1:, :-1] & valid_vertex[:-1, 1:] & valid_vertex[1:, 1:]
     area_vx2 = int(valid_quad.sum()) * step_size ** 2
@@ -472,8 +469,15 @@ def save_tifxyz(zyxs, path, uuid, step_size, voxel_size_um, source, *, layout_me
     }
     if layout_metadata is not None:
         metadata[ORIENTATION_METADATA_KEY] = layout_metadata
+    metadata_json = json.dumps(metadata, indent=4, allow_nan=False)
+
+    path = f'{path}/{uuid}'
+    os.makedirs(path, exist_ok=True)
+    Image.fromarray(np.asarray(zyxs[..., 2], dtype=np.float32)).save(f'{path}/x.tif')
+    Image.fromarray(np.asarray(zyxs[..., 1], dtype=np.float32)).save(f'{path}/y.tif')
+    Image.fromarray(np.asarray(zyxs[..., 0], dtype=np.float32)).save(f'{path}/z.tif')
     with open(f'{path}/meta.json', 'w') as f:
-        json.dump(metadata, f, indent=4, allow_nan=False)
+        f.write(metadata_json)
     return True
 
 
