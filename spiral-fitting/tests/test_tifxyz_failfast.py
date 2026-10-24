@@ -61,3 +61,30 @@ def test_existing_partial_sentinel_semantics_unchanged(tmp_path):
     save_tifxyz(z, tmp_path, "surface", 1, 1, "test")
     metadata = json.loads((tmp_path / "surface" / "meta.json").read_text())
     assert metadata["bbox"][0] == [-1., 2., -1.]
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf, 0])
+def test_invalid_voxel_size_fails_without_output(tmp_path, bad):
+    with pytest.raises(ValueError, match="voxel_size_um"):
+        save_tifxyz(grid(), tmp_path, "surface", 1, bad, "test")
+    assert not (tmp_path / "surface").exists()
+
+
+def test_unserializable_source_fails_without_output(tmp_path):
+    with pytest.raises(TypeError):
+        save_tifxyz(grid(), tmp_path, "surface", 1, 1, object())
+    assert not (tmp_path / "surface").exists()
+
+
+def test_nonfinite_metadata_fails_without_output(tmp_path):
+    with pytest.raises(ValueError):
+        save_tifxyz(grid(), tmp_path, "surface", 1, 1, {"invalid": float("nan")})
+    assert not (tmp_path / "surface").exists()
+
+
+def test_float32_overflow_fails_without_output(tmp_path):
+    z = grid().astype(np.float64)
+    z[0, 0, 0] = 1e100
+    with pytest.raises(ValueError, match="non-finite"):
+        save_tifxyz(z, tmp_path, "surface", 1, 1, "test")
+    assert not (tmp_path / "surface").exists()
