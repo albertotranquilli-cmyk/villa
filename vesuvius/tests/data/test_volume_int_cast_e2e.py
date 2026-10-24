@@ -618,7 +618,9 @@ def test_overflow_path_keeps_input_shape_for_vector_mean(tmp_path, fmt, form):
 # REDTEAM-025: global_zscore must keep NumPy's promotion of the std, as on main: a
 # float32 source with a float64 (or 0-d float64 array) std gives float64, and
 # 1e-20 / 1e30 stays ~1e-50 instead of underflowing to 0 in float32.
-@pytest.mark.parametrize("std", [np.float64(1e30), np.array(1e30, dtype=np.float64)], ids=["f64", "0d"])
+@pytest.mark.parametrize("std", [np.float64(1e30), np.array(1e30, dtype=np.float64),
+                                 np.int64(10**15), np.array(10**15, dtype=np.int64)],
+                         ids=["f64", "0d_f64", "i64", "0d_i64"])
 @pytest.mark.parametrize("fmt", FORMATS)
 def test_global_zscore_preserves_numpy_scalar_promotion(tmp_path, fmt, std):
     x = np.array([[[1e-20, 1.0]]], np.float32)
