@@ -1,0 +1,81 @@
+name: Volume original-versus-fix proof
+
+on:
+  push:
+    branches:
+      - codex/volume-e8d5737-before-after-proof
+
+permissions:
+  contents: read
+
+jobs:
+  real-volume-numeric-repro:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install small Volume runtime
+        run: |
+          python -m pip install "numpy==2.3.5" "zarr==2.18.7" "numcodecs==0.15.1" fsspec pynrrd requests PyYAML Pillow
+      - name: Run source-pinned before/after through actual Volume and Zarr2
+        env:
+          PYTHONPATH: vesuvius/src
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > /tmp/probe_volume.py <<'PY'
+          import numpy as np, zarr, tempfile, os
+          from vesuvius.data.volume import Volume
+          a=np.array([2**64-2,2**64-1],dtype=np.uint64).reshape(1,1,2)
+          path=os.path.join(tempfile.mkdtemp(prefix="volume_rc_"),"raw.zarr")
+          g=zarr.open_group(path,mode='w')
+          g.zeros(name='0',shape=a.shape,chunks=a.shape,dtype=a.dtype)[...]=a
+          got=Volume(type='zarr',path=path,verbose=False,
+                     normalization_scheme='instance_minmax',
+                     return_as_type='np.uint8')[0:1,0:1,0:2].ravel()
+          print('input uint64: '+repr([int(x) for x in a.ravel()]))
+          print('result uint8: '+repr([int(x) for x in got]))
+          print('input endpoints preserved in Zarr: '+str([int(x) for x in g['0'][:].ravel()]))
+          expected=[0,255]
+          print('expected mathematical result: '+repr(expected))
+          assert [int(v) for v in g['0'][:].ravel()]==[2**64-2,2**64-1]
+          if os.environ['EXPECT'] == 'OLD':
+              assert list(got)==[0,0], 'control did not reproduce old bug'
+          else:
+              assert list(got)==expected, 'candidate did not fix old bug'
+          PY
+          cp vesuvius/src/vesuvius/data/volume.py /tmp/candidate_volume.py
+          test "$(git hash-object /tmp/candidate_volume.py)" = "a09472fd9919a3235f886f74e66de0321b73ee8d"
+          git show 6f2024569404a46b0f008eee292773945c07a684:vesuvius/src/vesuvius/data/volume.py > vesuvius/src/vesuvius/data/volume.py
+          test "$(git hash-object vesuvius/src/vesuvius/data/volume.py)" = "b0f386f47f7e640f73826467338e73abd9809fe0"
+          EXPECT=OLD python /tmp/probe_volume.py > /tmp/before.txt
+          cp /tmp/candidate_volume.py vesuvius/src/vesuvius/data/volume.py
+          EXPECT=NEW python /tmp/probe_volume.py > /tmp/after.txt
+          echo 'BEFORE — upstream original:'; cat /tmp/before.txt
+          echo 'AFTER — proposed PR candidate:'; cat /tmp/after.txt
+          python - <<'PY'
+          from PIL import Image,ImageDraw,ImageFont
+          a=open('/tmp/before.txt').read().splitlines()
+          b=open('/tmp/after.txt').read().splitlines()
+          lines=['REAL PYTHON 3.12 / NUMPY 2.3.5 / ZARR 2.18.7 — EXECUTED',
+                 'UPSTREAM original code (sha b0f386f):',*a,'',
+                 'PR #2284 candidate code (sha a09472fd):',*b,'',
+                 'Verified input is identical. Two real Volume/Zarr reads.']
+          f=ImageFont.load_default()
+          img=Image.new('RGB',(1050,30*len(lines)+48),'#f6f7fb')
+          d=ImageDraw.Draw(img)
+          for i,s in enumerate(lines):
+              color='#064e3b' if ('AFTER' in s or 'result uint8: [0, 255]' in s) else ('#a11c1c' if 'result uint8: [0, 0]' in s else '#18253b')
+              d.text((25,20+30*i),s,fill=color,font=f)
+          img.save('volume_before_after_executed.png')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: volume-before-after-original-vs-e8d5737
+          path: volume_before_after_executed.png
+          if-no-files-found: error
