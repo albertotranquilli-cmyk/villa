@@ -1430,10 +1430,13 @@ class Volume:
                     "Internal Error: global_mean/std missing for global_zscore.")  # Should be caught in init
             gs = max(self.global_std, 1e-8)
             def gz(a):
-                # Same arithmetic as (a - mean) / gs, in place on the subtraction temporary.
+                # main computes (a - mean) / gs: the subtraction in result_type(a, mean), then the
+                # division in result_type(t, gs), which a NumPy float64 std (or 0-d array) widens.
+                # Divide in place only when that result dtype is the temporary's own dtype.
                 t = np.subtract(a, self.global_mean)
-                if np.result_type(t, gs) != t.dtype:
-                    return t / gs  # gs promotes (e.g. np.float64 std on float32 data), as on main
+                res_dtype = np.result_type(t, gs)
+                if res_dtype != t.dtype:
+                    return np.divide(t, gs, dtype=res_dtype)
                 return np.divide(t, gs, out=t)
             gz_stable = lambda a: ((a * 0.5 - np.asarray(self.global_mean) * 0.5) / gs) * 2  # x - mean overflows; halving is exact in the normal range; applied only to overflowing voxels
             with np.errstate(over='ignore', invalid='ignore'):
