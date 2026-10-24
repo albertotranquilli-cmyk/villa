@@ -1,0 +1,57 @@
+name: Volume real-API boundary demo
+
+on:
+  push:
+    branches:
+      - demo/volume-int-boundary-20261024
+
+permissions:
+  contents: read
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        zarr: ["2.18.7", "3.4.1"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 10
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install minimal runtime
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install numpy==2.3.5 fsspec pynrrd requests PyYAML Pillow
+          if [ "${{ matrix.zarr }}" = "2.18.7" ]; then
+            python -m pip install numcodecs==0.15.1 zarr==2.18.7
+          else
+            python -m pip install numcodecs==0.16.6 zarr==3.4.1
+          fi
+      - name: Execute real original and candidate Volume against Zarr
+        env:
+          PYTHONPATH: vesuvius/src
+        run: |
+          python demo/volume_int_boundary_demo.py --output-dir demo/results
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          p=Path("demo/results")
+          d=json.loads((p/"stats.json").read_text())
+          assert d["pass"] and d["ordinary_uint8_identity"]
+          assert d["upstream_output_unique"]==[0]
+          assert d["candidate_output_unique"]==[0,255]
+          assert d["changed_voxels"]==2048
+          assert all((p/name).is_file() for name in ["demo_before_after.png","stats.json","log.txt"])
+          print("PASS: pinned original-versus-fix demo + images + statistics")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: volume-uint64-demo-zarr-${{ matrix.zarr }}
+          path: demo/results/
+          if-no-files-found: error
