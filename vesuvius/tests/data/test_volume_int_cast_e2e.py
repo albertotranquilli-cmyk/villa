@@ -647,7 +647,9 @@ def test_global_zscore_preserves_numpy_scalar_promotion(tmp_path, fmt, std):
 def test_percentile_minmax_wide_integer_span(tmp_path, fmt, src):
     base = np.arange(999)
     outlier = np.iinfo(src).min if src == "int64" else np.iinfo(src).max
-    data = np.concatenate([[outlier], base]).astype(src).reshape(1, 1, -1)
+    # Construct directly in the integer dtype: concatenation can promote uint64 max to float64.
+    data = np.array([int(outlier)] + base.tolist(), dtype=src).reshape(1, 1, -1)
+    assert int(data[0, 0, 0]) == int(outlier)
     out = _read(tmp_path, data, fmt, normalization_scheme="percentile_minmax", return_as_type="np.float64")
     vals = data.ravel().astype(object)
     s = sorted(vals)
